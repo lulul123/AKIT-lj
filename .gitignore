@@ -1,0 +1,22 @@
+# 本地数据，不上传
+data_lj/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 输出和日志
+outputs/
+results/
+logs/
+*.log
+*.tmp
