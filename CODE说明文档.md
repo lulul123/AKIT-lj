@@ -1,5 +1,27 @@
 # Code 目录 Python 代码说明文档
 
+> [!IMPORTANT]
+> **一句话结论：** 当前最完整、且仓库内依赖闭合的训练实现是 **`A-KIT_lj_agent.py` + `akit_utils_agent.py`**；但在解决**数据路径硬编码、正式入口未明确、训练/输出逻辑不一致**等问题前，还不能作为可复现的标准训练流水线直接使用。
+
+## 快速阅读指南
+
+如果希望快速掌握项目，建议按以下顺序阅读：
+
+1. **整体目标与当前结论：** 第 1 节
+2. **主数据流和模型输入输出：** 第 4 节
+3. **推荐关注的代码版本：** 第 5.5、5.6 节
+4. **能否直接运行及如何运行：** 第 6 节
+5. **已确认问题和改造重点：** 第 7、8 节
+
+| 重点问题 | 快速结论 |
+|---|---|
+| **核心任务** | 用每秒 `(9, 100)` 的 IMU+速度数据预测 15 维 Q 缩放量，并通过可微 Kalman 更新的位置误差训练网络 |
+| **当前首选实现** | `A-KIT_lj_agent.py` + `akit_utils_agent.py` |
+| **可否直接训练** | **不可以**：训练入口写死 Windows 数据路径，且正式版本尚未明确 |
+| **核心模型** | Conv1d Patch Embedding + Set Transformer + 15 维输出头 |
+| **核心风险** | 历史版本并存、路径硬编码、缺失模块、数据解析差异、训练与输出阶段逻辑不一致 |
+| **优先阅读** | 第 4 节主流程、第 7 节风险、第 8 节待确认事项 |
+
 ## 1. 文档范围与结论摘要
 
 本文档覆盖 `Code` 目录下除 `__pycache__` 外的全部 8 个 Python 文件，共约 6091 行：
@@ -15,9 +37,10 @@
 | `data_test.py` | 526 | 独立的数据读取与张量形状检查脚本 | 有 |
 | `resample_500_to_100.py` | 342 | 高频 IMU/速度文本数据的 500 Hz → 100 Hz 下采样工具 | 有，使用 `argparse` |
 
-整体目标是：将每个整数秒内的 100 个 IMU 六维样本与速度三维样本拼成 `(9, 100)` 输入，通过卷积分块和 Set Transformer 预测 15 维过程噪声缩放量，再把该缩放量送入单步可微 Kalman 更新，以更新后状态的前三维位置与参考位置之间的均方误差训练网络。
+**整体目标：** 将每个整数秒内的 **100 个 IMU 六维样本与速度三维样本**拼成 **`(9, 100)` 输入**，通过卷积分块和 Set Transformer 预测 **15 维过程噪声缩放量**，再把该缩放量送入**单步可微 Kalman 更新**，以更新后状态的前三维位置与参考位置之间的**均方误差（MSE）**训练网络。
 
-需要特别注意：仓库同时保留了多代实验脚本，它们并不是同一条都可直接运行的生产流水线。按当前文件依赖看，`A-KIT_lj_agent.py` + `akit_utils_agent.py` 是依赖闭合的一组；`A-KIT_lj.py` 导入的 `akit_utils.py` 在当前仓库中不存在。各训练入口又写死了 Windows 数据绝对路径，因此在当前 Linux 仓库路径下不能不经配置直接完成训练。哪个版本应被认定为正式入口，代码中没有声明，**需要进一步确认**。
+> [!WARNING]
+> 仓库同时保留了多代实验脚本，**它们不是一组均可直接运行的生产流水线**。按当前文件依赖看，**`A-KIT_lj_agent.py` + `akit_utils_agent.py` 是依赖闭合的一组**；`A-KIT_lj.py` 导入的 `akit_utils.py` 在当前仓库中不存在。各训练入口还写死了 Windows 数据绝对路径，因此在当前 Linux 仓库路径下**不能不经配置直接完成训练**。代码也没有声明哪个版本是正式入口，**需要进一步确认**。
 
 ## 2. 文件间依赖关系
 
@@ -63,7 +86,8 @@
 | PyTorch | Dataset/DataLoader、神经网络、优化器、自动微分 Kalman 计算 | 除重采样脚本外的文件 |
 | Matplotlib | 非交互式训练曲线和分析图 | `A-KIT_copy.py`、`A-KIT_lj.py`、`A-KIT_lj_agent.py` |
 
-仓库中未发现 `requirements.txt`、`pyproject.toml` 或 `setup.py`，Python/PyTorch/NumPy/Matplotlib 的具体版本要求**需要进一步确认**。
+> [!NOTE]
+> 仓库中未发现 `requirements.txt`、`pyproject.toml` 或 `setup.py`，因此 **Python、PyTorch、NumPy、Matplotlib 的具体版本要求需要进一步确认**。
 
 ## 3. 当前数据格式（对 `data_lj` 的只读核对）
 
@@ -83,7 +107,8 @@
 | `Inno.txt` | 同类多行格式 | `3 × 1` 新息向量 |
 | `Q.txt` | 同类多行格式 | `15 × 15` 原始过程噪声矩阵 |
 
-参考文件表头表明零基索引 9～11 实际是 `X-ECEF`、`Y-ECEF`、`Z-ECEF`。`load_truePos` 中的局部变量却命名为 `x_ll/y_ll/z_ll`，相关注释也有 “X-LL” 表述；实际读取的是 ECEF 坐标，而不是表头稍后的 X/Y/Z-LL 字段。
+> [!IMPORTANT]
+> 参考文件零基索引 9～11 实际对应 **`X-ECEF`、`Y-ECEF`、`Z-ECEF`**。虽然 `load_truePos` 的局部变量命名为 `x_ll/y_ll/z_ll`，相关注释也有 “X-LL” 表述，但代码**实际读取的是 ECEF 坐标**，不是表头稍后的 X/Y/Z-LL 字段。
 
 数据只读样例：
 
@@ -109,7 +134,7 @@ WeekSecond H
 
 ### 4.1 高层调用流程
 
-以依赖闭合的 `A-KIT_lj_agent.py` 为例：
+以下以**当前依赖闭合的 `A-KIT_lj_agent.py`** 为例：
 
 ```text
 python Code/A-KIT_lj_agent.py
@@ -128,7 +153,7 @@ python Code/A-KIT_lj_agent.py
              |               +--> 对所有时间键求交集
              |               +--> 生成每秒一个样本
              |
-             +--> random_split(80% train, 20% val)
+             +--> 按 --train-dirs / --val-dirs 加载互不重叠的完整轨迹
              +--> 统计训练集 9 通道均值/标准差
              +--> DataLoader
              +--> Network + Adam + ReduceLROnPlateau
@@ -181,13 +206,14 @@ python Code/A-KIT_lj_agent.py
 | `stateX` | `(15, 1)` | `(B, 15, 1)` | `float64` |
 | `Inno` | `(3, 1)` | `(B, 3, 1)` | `float64` |
 
-`A-KIT_lj_agent.py` 随后只用训练子集计算每个 IMU/速度通道的全局均值和标准差，并广播执行：
+`A-KIT_lj_agent.py` 随后**只使用训练子集**计算每个 IMU/速度通道的全局均值和标准差，并广播执行：
 
 ```python
 imu_normalized = (imu - imu_mean[None, :, None]) / imu_std[None, :, None]
 ```
 
-异常时静默退化为均值 0、标准差 1。主流程的训练与验证使用该归一化；小规模实验虽然计算并保存统计量，但其训练/验证循环没有实际应用该归一化，这是代码可见的不一致。
+> [!WARNING]
+> 异常时会静默退化为均值 0、标准差 1。主流程的训练与验证使用该归一化；但小规模实验虽然计算并保存统计量，其训练/验证循环**并未实际应用归一化**，两条流程存在明确不一致。
 
 ### 4.3 模型结构与张量流
 
@@ -261,7 +287,10 @@ x_post = x_pred + K @ Inno
 | `(B, 15)` | 取 `Q_origin` 对角线，与 15 维缩放量相乘，再用 `diag_embed` 构造纯对角矩阵；原 `Q_origin` 非对角元素不保留 |
 | `(B, 15, 15)` | `Q_origin * Q_diag`，逐元素相乘 |
 
-agent 主流程传入 `(B, 15)`，所以走第一种路径。函数内部统一转 `float64`，通过 PyTorch 运算保留自动微分图。它还计算 Joseph 形式的 `P_post` 以提高半正定稳定性，但 `P_post` 不返回，也不参与后续样本；每个样本仍是独立的单步更新，不是跨时间递推的 Kalman 序列。
+agent 主流程传入 **`(B, 15)`**，所以走第一种路径。函数内部统一转为 **`float64`**，通过 PyTorch 运算保留自动微分图。它还计算 Joseph 形式的 `P_post` 以提高半正定稳定性，但 `P_post` **不返回，也不参与后续样本**。
+
+> [!IMPORTANT]
+> 这里的 Kalman 计算是**每个样本独立的单步更新**，并不是跨时间递推的 Kalman 序列。
 
 损失为：
 
@@ -269,7 +298,7 @@ agent 主流程传入 `(B, 15)`，所以走第一种路径。函数内部统一�
 loss = mean((pos_predict - pos_true) ** 2)
 ```
 
-训练信号由位置误差经 Kalman 矩阵运算反传到网络预测的过程噪声缩放量。代码没有直接以 `Q_origin` 对角线作为常规训练标签；它只在单批过拟合自检中把该对角线当临时监督目标。
+**训练信号链路：** 位置误差 → Kalman 矩阵运算 → 网络预测的过程噪声缩放量。代码**没有**直接以 `Q_origin` 对角线作为常规训练标签；它只在单批过拟合自检中把该对角线当作临时监督目标。
 
 状态 15 个维度的完整物理定义、`Inno` 的生成方式、`Q_origin` 的单位，以及 `stateX` 是否严格代表“上一时刻状态”，无法仅从这些 Python 文件确认，**需要进一步确认**。
 
@@ -277,7 +306,7 @@ loss = mean((pos_predict - pos_true) ** 2)
 
 ### 5.1 `Code/A-KIT.py`
 
-用途：最早期的自包含训练原型，意在用连续 100 个 IMU+速度点预测过程噪声，并用位置 MSE 训练。
+**用途：** 最早期的自包含训练原型，意在用连续 100 个 IMU+速度点预测过程噪声，并用位置 MSE 训练。
 
 | 符号 | 类型 | 作用/备注 |
 |---|---|---|
@@ -291,11 +320,12 @@ loss = mean((pos_predict - pos_true) ** 2)
 | `IMUDataset` | Dataset | 前半先包装 MultiDataset；随后同类中重复定义的 `__len__`/`__getitem__` 覆盖包装逻辑并访问未初始化字段 |
 | `kalman_filter()` | 函数 | 单步可微 Kalman 更新，`P_pred` 直接加 `Q_diag`，参数 `Q_origin` 未使用 |
 
-直接运行时，`if __name__ == "__main__": main()` 位于所有模型和 Dataset 类定义之前。解释器调用 `main()` 时 `MultiDatasetIMU` 尚未定义，会首先触发 `NameError`。即便调整入口顺序，仍有占位路径、样本字典缺少 `time`、`Network` 对 `Q` 的越界索引以及 `IMUDataset` 覆盖方法等问题。
+> [!CAUTION]
+> **该文件当前不能直接运行。** `if __name__ == "__main__": main()` 位于所有模型和 Dataset 类定义之前，调用 `main()` 时 `MultiDatasetIMU` 尚未定义，会首先触发 `NameError`。即便调整入口顺序，仍存在占位路径、样本字典缺少 `time`、`Network` 对 `Q` 的越界索引以及 `IMUDataset` 方法被覆盖等问题。
 
 ### 5.2 `Code/A-KIT_clean.py`
 
-用途：对早期原型进行去重和整理，入口移到文件末尾，数据读取改为“每整数秒必须恰好 `seq_len` 点”。
+**用途：** 对早期原型进行去重和整理，入口移到文件末尾，数据读取改为“每整数秒必须恰好 `seq_len` 点”。
 
 | 符号组 | 作用 |
 |---|---|
@@ -306,11 +336,12 @@ loss = mean((pos_predict - pos_true) ** 2)
 | `kalman_filter()` | 使用 `Phi P Phi^T + Q_diag @ Q_origin` 的过程噪声项 |
 | `example_usage()` / `check_time_alignment()` | 示例和文件/对齐检查，不被 `main()` 调用 |
 
-与当前数据的主要不兼容点：读取 `StateX.txt`，而只读观察到的是 `StateX_new.txt` 和小写 `stateX.txt`；简化参考读取器会因实际数据行含 `Fixed` 等字母而跳过数据；矩阵读取器假设单行容纳全部元素，而当前矩阵是多行格式。
+> [!WARNING]
+> **与当前数据的主要不兼容点：** 文件读取目标、参考数据解析和矩阵格式均不匹配。代码读取 `StateX.txt`，而当前观察到的是 `StateX_new.txt` 和小写 `stateX.txt`；简化参考读取器会跳过含 `Fixed` 等字母的数据行；矩阵读取器假设全部元素位于单行，而当前矩阵采用多行格式。
 
 ### 5.3 `Code/A-KIT_copy.py`
 
-用途：在 clean 版基础上适配更复杂的参考/矩阵格式，增加训练监控、图表、文本报告和模型保存。
+**用途：** 在 clean 版基础上适配更复杂的参考/矩阵格式，增加训练监控、图表、文本报告和模型保存。
 
 | 符号 | 作用 |
 |---|---|
@@ -324,11 +355,14 @@ loss = mean((pos_predict - pos_true) ** 2)
 | `generate_training_plots()` | 输出 2×3 子图：loss、耗时、位置误差、Q 演化、batch loss、学习率 |
 | `generate_final_report()` | 保存 `final_model.pth`、详细分析图和 `training_report.txt` |
 
-输出目录名为 `training_results_YYYYmmdd_HHMMSS`。脚本硬编码 Windows `F:\...\data_lj`，当前环境不能直接使用该配置。
+**输出目录：** `training_results_YYYYmmdd_HHMMSS`。
+
+> [!WARNING]
+> 脚本硬编码 Windows `F:\...\data_lj`，**当前环境不能直接使用该配置**。
 
 ### 5.4 `Code/A-KIT_lj.py`
 
-用途：将数据读取/Kalman 抽到 `akit_utils`，将合并数据随机划分为 80% 训练、20% 验证，增加轻量输出开关和 `--small` 实验入口。
+**用途：** 将数据读取/Kalman 抽到 `akit_utils`，将合并数据随机划分为 80% 训练、20% 验证，增加轻量输出开关和 `--small` 实验入口。
 
 模块级全局变量：
 
@@ -349,11 +383,12 @@ loss = mean((pos_predict - pos_true) ** 2)
 | `generate_training_plots()` / `generate_final_report()` | 与 copy 版同类的绘图和报告功能 |
 | `run_small_scale_experiment()` | 随机最多取 `max_samples`，固定按 80/20 划分，运行短训练/验证 |
 
-`run_small_scale_experiment()` 参数 `val_ratio` 没有用于划分，代码固定为 80/20；导入的 `csv`、`shutil` 未使用。当前仓库没有 `Code/akit_utils.py`，所以脚本会在导入阶段失败。缺失文件是否本应由 `akit_utils_agent.py` 替代，**需要进一步确认**。
+> [!CAUTION]
+> **该文件当前会在导入阶段失败：** 仓库中没有 `Code/akit_utils.py`。缺失文件是否本应由 `akit_utils_agent.py` 替代，**需要进一步确认**。此外，`run_small_scale_experiment()` 的 `val_ratio` 参数未用于划分，代码固定使用 80/20；导入的 `csv`、`shutil` 也未使用。
 
 ### 5.5 `Code/A-KIT_lj_agent.py`
 
-用途：在 lj 版上集中诊断“Q 输出/梯度是否有效”，是功能最多的训练实验版本。
+**用途：** 在 lj 版上集中诊断“Q 输出/梯度是否有效”，是**当前功能最多的训练实验版本**。
 
 新增全局量除四个输出开关外还有：
 
@@ -372,21 +407,23 @@ loss = mean((pos_predict - pos_true) ** 2)
 - 大量输出 Q 分布、计算图、参数梯度、Kalman 状态更新等诊断信息。
 - 写 `batch_metrics.csv`、`epoch_metrics.csv`、`Test.txt`、归一化统计、loss 图、训练集预测图和最终模型。
 
-模型与 lj 版的主要差异：层声明为 `float32`，最终输出头没有 ReLU；主流程之后调用 `.double()`，实际又把整网转换为双精度。正式训练使用 `softplus(raw) + 1.0`，验证相同；训练结束生成 `TrainOut` 时只使用 `softplus(raw)`，少了 `+1.0`，前后不一致。
+> [!WARNING]
+> **Q 输出变换存在不一致：** 正式训练和验证使用 `softplus(raw) + 1.0`，但训练结束生成 `TrainOut` 时只使用 `softplus(raw)`，少了 `+1.0`。此外，模型层声明为 `float32`，主流程随后调用 `.double()`，实际将整网转换为双精度。
 
-`batch_metrics.csv` 的表头声明 9 列：
+`batch_metrics.csv` 的表头声明 **9 列**：
 
 ```text
 epoch,batch,train_loss,Q_min,Q_mean,Q_max,grad_Q_norm,param_grad_norm,pos_error_mean
 ```
 
-实际每行仅写 5 个值：epoch、batch、loss、Q mean、总梯度范数。后续消费者若按表头解析会发生列语义错位。
+> [!WARNING]
+> 实际每行仅写 **5 个值**：epoch、batch、loss、Q mean、总梯度范数。后续程序若按表头解析，**会发生列语义错位**。
 
-`run_small_scale_experiment()` 支持额外的 `run_overfit`、`overfit_steps`、`overfit_lr`，但同样忽略 `val_ratio` 并固定 80/20。命令行 `--small` 当前会开启 500 步单批过拟合。
+`run_small_scale_experiment()` 支持额外的 `run_overfit`、`overfit_steps`、`overfit_lr`。当前版本按 `--train-dirs` 和 `--val-dirs` 分别加载轨迹；小模式只在两个集合内部各自抽样。命令行 `--small` 可通过 `--run-overfit` 显式开启单批过拟合。
 
 ### 5.6 `Code/akit_utils_agent.py`
 
-用途：为 agent 版提供共享工具，是唯一被另一个现存 Python 文件直接导入的仓库内模块。
+**用途：** 为 agent 版提供共享工具，是**唯一被另一个现存 Python 文件直接导入的仓库内模块**。
 
 | 符号 | 作用 |
 |---|---|
@@ -408,7 +445,7 @@ epoch,batch,train_loss,Q_min,Q_mean,Q_max,grad_Q_norm,param_grad_norm,pos_error_
 
 ### 5.7 `Code/data_test.py`
 
-用途：独立复刻 copy 版数据读取器，对路径、样本数、首样本和前 5 个样本的各字段形状进行检查；不训练模型。
+**用途：** 独立复刻 copy 版数据读取器，对路径、样本数、首样本和前 5 个样本的各字段形状进行检查；**不训练模型**。
 
 | 符号 | 作用 |
 |---|---|
@@ -417,11 +454,12 @@ epoch,batch,train_loss,Q_min,Q_mean,Q_max,grad_Q_norm,param_grad_norm,pos_error_
 | `MultiDatasetIMU` | IMU 严格分秒、Vel 2 ms 最近邻/填充、矩阵时间求交集 |
 | `test_data_loading()` | 使用 4 个硬编码 Windows 数据目录执行完整性检查 |
 
-文件导入了 `torch.nn`、`DataLoader`、`torch.optim`，但测试流程没有使用这些符号。它读取 `StateX.txt`；当前数据目录观察到的是 `StateX_new.txt` 和小写 `stateX.txt`，在区分大小写的文件系统上会导致对应字典为空、最终没有对齐样本。入口路径也写死为 Windows 路径。
+> [!WARNING]
+> 该脚本读取 `StateX.txt`，但当前数据目录观察到的是 `StateX_new.txt` 和小写 `stateX.txt`；在区分大小写的文件系统上会导致对应字典为空，最终没有对齐样本。入口路径也写死为 Windows 路径。
 
 ### 5.8 `Code/resample_500_to_100.py`
 
-用途：独立的文本降采样工具，会写入用户指定的输出文件；它不是训练入口自动调用的预处理步骤。
+**用途：** 独立的文本降采样工具，会写入用户指定的输出文件；**它不是训练入口自动调用的预处理步骤**。
 
 | 函数 | 作用 |
 |---|---|
@@ -464,6 +502,9 @@ python3 Code/resample_500_to_100.py \
 
 ## 6. 程序入口、输入输出与运行方式
 
+> [!IMPORTANT]
+> **当前结论：训练脚本均不具备“克隆仓库后直接运行”的条件。** 最接近可用的是 `A-KIT_lj_agent.py`，但仍需先配置数据路径并确认正式训练版本。
+
 ### 6.1 入口汇总
 
 | 命令 | 实际行为 | 当前仓库状态 |
@@ -478,14 +519,14 @@ python3 Code/resample_500_to_100.py \
 | `python3 Code/data_test.py` | 数据读取/形状检查 | Windows 路径写死，且 `StateX.txt` 命名与当前 Linux 数据不匹配 |
 | `python3 Code/resample_500_to_100.py ...` | 下采样 | 参数完整时可独立运行并写指定输出 |
 
-训练脚本没有命令行参数用于覆盖数据根目录、batch size、epoch 或学习率。若要运行，需先确认正式版本和数据目录配置方式；本文档遵守“不修改业务代码”要求，没有进行这些调整。
+**共同限制：** 训练脚本没有命令行参数用于覆盖数据根目录、batch size、epoch 或学习率。若要运行，需先确认正式版本和数据目录配置方式；本文档遵守“不修改业务代码”要求，没有进行这些调整。
 
 ### 6.2 训练输入
 
-- 文件输入：一个或多个数据目录中的 IMU、速度、参考位置及 7 类矩阵文件。
-- 网络输入：每样本 `(9, 100)` 的 IMU+Vel 张量。
-- Kalman 固定输入：`Phi/H/R/P/Inno/stateX/Q_origin`。
-- 监督目标：三维参考 ECEF 位置。
+- **文件输入：** 一个或多个数据目录中的 IMU、速度、参考位置及 7 类矩阵文件。
+- **网络输入：** 每样本 `(9, 100)` 的 IMU+Vel 张量。
+- **Kalman 固定输入：** `Phi/H/R/P/Inno/stateX/Q_origin`。
+- **监督目标：** 三维参考 ECEF 位置。
 
 ### 6.3 训练输出
 
@@ -503,25 +544,29 @@ python3 Code/resample_500_to_100.py \
 | batch/epoch CSV | 否 | 否 | 是 |
 | 详细图和文本报告 | 默认是 | 由开关控制 | 由开关控制 |
 
-模型文件只保存 `state_dict` 和少量训练元数据，没有统一保存完整模型构造参数、数据划分索引、优化器状态、scheduler 状态或所有随机状态。如何加载并执行独立推理没有对应入口，**需要进一步确认**。
+> [!WARNING]
+> 模型文件只保存 `state_dict` 和少量训练元数据，**没有统一保存**完整模型构造参数、数据划分索引、优化器状态、scheduler 状态或所有随机状态。当前也没有独立的模型加载与推理入口，**需要进一步确认**。
 
 ## 7. 已确认的可运行性与一致性风险
 
 以下均来自当前代码静态分析或与只读数据格式的直接对照，不是对未知业务规则的猜测：
 
+> [!CAUTION]
+> **优先处理顺序：** 先解决所有“高”优先级问题，使入口和数据读取可运行；再修复“中”优先级的训练一致性问题；最后确认“低”优先级实现究竟是设计选择还是缺陷。
+
 | 优先级 | 位置 | 已确认问题/风险 |
 |---|---|---|
-| 高 | `A-KIT.py` | `main()` 在类定义前执行，直接运行首先出现 `NameError` |
-| 高 | `A-KIT.py` | `MultiDatasetIMU` 样本未写 `time`，但 `__getitem__` 读取它；`IMUDataset` 方法被重复定义覆盖 |
-| 高 | `A-KIT.py` | `Network` 对最后一维长度为 1 的输入索引 `-2`，会越界 |
-| 高 | `A-KIT_lj.py` | 导入的 `akit_utils.py` 不存在 |
-| 高 | 多个训练/测试脚本 | 数据根目录硬编码为另一台机器的 Windows 绝对路径；当前环境不可直接运行 |
-| 高 | `A-KIT_clean.py` | 位置/矩阵解析假设与当前 IE 参考文件、多行矩阵格式不匹配 |
-| 高 | `data_test.py` | 请求 `StateX.txt`，当前区分大小写环境中没有该精确文件名 |
-| 中 | agent 主/小流程 | `val_ratio` 参数未使用，始终固定 80/20 |
-| 中 | agent 主流程 | TrainOut 阶段 Q 变换少 `+1.0`，与训练/验证不一致 |
-| 中 | agent 主流程 | batch CSV 表头 9 列，实际数据 5 列 |
-| 中 | agent 小流程 | 计算归一化统计但不对训练/验证输入应用 |
+| **高** | `A-KIT.py` | **`main()` 在类定义前执行，直接运行首先出现 `NameError`** |
+| **高** | `A-KIT.py` | **`MultiDatasetIMU` 样本未写 `time`，但 `__getitem__` 读取它；`IMUDataset` 方法被重复定义覆盖** |
+| **高** | `A-KIT.py` | **`Network` 对最后一维长度为 1 的输入索引 `-2`，会越界** |
+| **高** | `A-KIT_lj.py` | **导入的 `akit_utils.py` 不存在** |
+| **高** | 多个训练/测试脚本 | **数据根目录硬编码为另一台机器的 Windows 绝对路径；当前环境不可直接运行** |
+| **高** | `A-KIT_clean.py` | **位置/矩阵解析假设与当前 IE 参考文件、多行矩阵格式不匹配** |
+| **高** | `data_test.py` | **请求 `StateX.txt`，当前区分大小写环境中没有该精确文件名** |
+| **中** | agent 主/小流程 | `val_ratio` 参数未使用，始终固定 80/20 |
+| **中** | agent 主流程 | TrainOut 阶段 Q 变换少 `+1.0`，与训练/验证不一致 |
+| **中** | agent 主流程 | batch CSV 表头 9 列，实际数据 5 列 |
+| **中** | agent 小流程 | 计算归一化统计但不对训练/验证输入应用 |
 | 中 | 工具 Dataset | Vel 匹配失败会前向填充/补零，仍可能被计为该秒完整 |
 | 中 | 模型类 | `SetTransformer.fc_out` 未使用，`Network.forward` 的第二参数多数版本未使用 |
 | 中 | Kalman 工具 | 计算 `P_post` 但不跨样本递推；实际是独立单步更新 |
@@ -530,17 +575,23 @@ python3 Code/resample_500_to_100.py \
 
 ## 8. 需要进一步确认的事项
 
-1. 正式维护和运行的训练入口究竟是 `A-KIT_copy.py`、`A-KIT_lj.py` 还是 `A-KIT_lj_agent.py`。
-2. `A-KIT_lj.py` 所需的 `akit_utils.py` 是否遗失，还是应改用 `akit_utils_agent.py`。
-3. 15 维状态向量每一维的物理含义、坐标系、单位及误差状态/绝对状态定义。
-4. `StateX_new.txt` 与 `stateX.txt` 的来源、时间偏移和业务差异。
-5. 位置监督是否确实应使用 ECEF 字段；当前代码变量/注释中的 “LL” 与实际字段不一致。
-6. IMU 和 Vel 未在 2 ms 内匹配时，前向填充或补零是否满足业务要求。
-7. 数据划分是否允许随机打散同一轨迹的相邻秒。当前随机样本级 80/20 划分可能让同一数据目录的相邻时刻同时进入训练和验证；是否需要按轨迹/目录划分无法从代码确认。
-8. Q 网络输出究竟表示过程噪声本身、对 `Q_origin` 的对角缩放，还是完整矩阵的比例因子。不同历史版本的公式不完全一致。
-9. 训练位置误差输出标注为“米”，这依赖 ECEF 坐标确以米为单位；参考文件表头和常见格式支持这一理解，但 Python 代码本身未显式声明单位。
-10. 生产推理、模型加载、复现实验所需的固定依赖版本和配置管理方式。
+1. **正式入口：** 正式维护和运行的训练入口究竟是 `A-KIT_copy.py`、`A-KIT_lj.py` 还是 `A-KIT_lj_agent.py`。
+2. **缺失模块：** `A-KIT_lj.py` 所需的 `akit_utils.py` 是否遗失，还是应改用 `akit_utils_agent.py`。
+3. **状态定义：** 15 维状态向量每一维的物理含义、坐标系、单位及误差状态/绝对状态定义。
+4. **状态文件差异：** `StateX_new.txt` 与 `stateX.txt` 的来源、时间偏移和业务差异。
+5. **位置坐标系：** 位置监督是否确实应使用 ECEF 字段；当前代码变量/注释中的 “LL” 与实际字段不一致。
+6. **速度缺失策略：** IMU 和 Vel 未在 2 ms 内匹配时，前向填充或补零是否满足业务要求。
+7. **数据划分策略：** 当前入口已使用 `--train-dirs` 和 `--val-dirs` 按完整轨迹划分，并检查两组目录不重叠；最终测试模式仍待实现。
+8. **Q 的业务定义：** Q 网络输出究竟表示过程噪声本身、对 `Q_origin` 的对角缩放，还是完整矩阵的比例因子。不同历史版本的公式不完全一致。
+9. **误差单位：** 训练位置误差输出标注为“米”，这依赖 ECEF 坐标确以米为单位；参考文件表头和常见格式支持这一理解，但 Python 代码本身未显式声明单位。
+10. **复现与推理：** 生产推理、模型加载、复现实验所需的固定依赖版本和配置管理方式。
 
 ## 9. 总结
 
-代码库体现了从自包含原型到诊断增强训练实验的迭代过程。稳定的概念主线是“100 Hz IMU+速度窗口 → Patch/Set Transformer → 15 维 Q 缩放 → 单步可微 Kalman → 三维位置 MSE”。当前最完整且仓库内依赖闭合的实现是 `A-KIT_lj_agent.py` 与 `akit_utils_agent.py`，但仍需要解决硬编码路径、版本选择和若干训练/输出一致性问题后，才能形成可复现的标准运行入口。
+代码库体现了从自包含原型到诊断增强训练实验的迭代过程。
+
+**稳定的概念主线：** `100 Hz IMU+速度窗口 → Patch/Set Transformer → 15 维 Q 缩放 → 单步可微 Kalman → 三维位置 MSE`
+
+**当前最完整且仓库内依赖闭合的实现：** `A-KIT_lj_agent.py` + `akit_utils_agent.py`
+
+**形成标准运行入口前必须处理：** 数据路径硬编码、正式版本选择、缺失依赖，以及训练/验证/输出阶段的若干一致性问题。

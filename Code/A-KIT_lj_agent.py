@@ -48,38 +48,34 @@ def main(config):
     epochs = config["epochs"]
     learning_rate = config["learning_rate"]
     device = resolve_device(config["device"])
-    data_dirs = config["data_dirs"]
+    train_dirs = config["train_dirs"]
+    val_dirs = config["val_dirs"]
     output_dir = str(create_output_dir(config["output_root"], config["experiment_name"]))
     save_json(os.path.join(output_dir, "config.json"), config)
     save_json(os.path.join(output_dir, "environment.json"), collect_environment(config["repo_root"]))
     print(f"Device: {device}")
     print(f"Experiment outputs: {output_dir}")
 
-    # 创建多数据集加载器
-    # 合并所有 data_dirs 后按比例划分训练/验证（80/20）
-    print("=> 合并数据集并按 80/20 划分训练/验证")
-    combined_dataset = MultiDatasetIMU(data_dirs, seq_len=seq_len)
-    total_N = len(combined_dataset)
-    if total_N == 0:
-        raise RuntimeError("No samples found in combined datasets")
-    train_N = int(total_N * (1.0 - config["val_ratio"]))
-    val_N = total_N - train_N
-    from torch.utils.data import random_split
-    split_generator = torch.Generator().manual_seed(config["seed"])
-    train_dataset, val_dataset = random_split(
-        combined_dataset, [train_N, val_N], generator=split_generator
-    )
+    # 每个目录代表一条完整轨迹。训练集和验证集分别加载，避免相邻秒泄漏。
+    print("=> 按完整轨迹加载训练集和验证集")
+    train_dataset = MultiDatasetIMU(train_dirs, seq_len=seq_len)
+    val_dataset = MultiDatasetIMU(val_dirs, seq_len=seq_len)
+    train_N = len(train_dataset)
+    val_N = len(val_dataset)
+    if train_N == 0 or val_N == 0:
+        raise RuntimeError("No samples found in train or validation trajectories")
     save_json(
         os.path.join(output_dir, "split_manifest.json"),
         {
-            "strategy": "legacy_random_sample_split",
-            "seed": config["seed"],
-            "train_indices": list(train_dataset.indices),
-            "val_indices": list(val_dataset.indices),
+            "strategy": "trajectory_directory_split",
+            "train_dirs": train_dirs,
+            "val_dirs": val_dirs,
+            "train_samples": train_N,
+            "val_samples": val_N,
         },
     )
     # 打印数据读取相关摘要（保留）
-    print(f"Total samples: {total_N}, Train: {train_N}, Val: {val_N}")
+    print(f"Total samples: {train_N + val_N}, Train: {train_N}, Val: {val_N}")
 
     # 计算训练集全局 IMU per-channel 均值/方差（用于统一归一化）
     try:
@@ -1052,11 +1048,11 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
         print(f"平均位置误差: {np.mean(position_errors):.4f}米")
 
 
-def run_small_scale_experiment(data_dirs,
+def run_small_scale_experiment(train_dirs,
+                               val_dirs,
                                max_samples=200,
                                epochs=5,
                                batch_size=8,
-                               val_ratio=0.1,
                                learning_rate=1e-2,
                                seq_len=100,
                                device=None,
@@ -1068,48 +1064,38 @@ def run_small_scale_experiment(data_dirs,
                                experiment_name="akit_small",
                                runtime_config=None):
     """
-    小规模实验：合并数据后按 max_samples 随机抽取（若指定），再按 80/20 划分为训练/验证
+    小规模实验：按完整轨迹分开加载训练/验证集，并在两个集合内各自抽样。
     """
     import csv
     import shutil
-    from torch.utils.data import Subset, random_split
+    from torch.utils.data import Subset
 
     set_reproducible_seed(seed)
     if device is None:
         device = resolve_device("auto")
 
     print("Loading dataset (small-scale)...")
-    full_dataset = MultiDatasetIMU(data_dirs, seq_len=seq_len)
-    N = len(full_dataset)
-    if N == 0:
-        print("没有可用样本，检查数据路径/对齐。")
-        return
+    full_train_dataset = MultiDatasetIMU(train_dirs, seq_len=seq_len)
+    full_val_dataset = MultiDatasetIMU(val_dirs, seq_len=seq_len)
+    if len(full_train_dataset) == 0 or len(full_val_dataset) == 0:
+        raise RuntimeError("没有可用的训练或验证样本，请检查轨迹目录和数据对齐。")
 
-    use_n = min(max_samples, N)
+    rng = np.random.default_rng(seed)
 
-    # 随机抽取 use_n 个样本（如果 use_n < N）
-    if use_n < N:
-        indices = np.random.permutation(N)[:use_n].tolist()
-        working_dataset = Subset(full_dataset, indices)
-    else:
-        indices = list(range(N))
-        working_dataset = full_dataset
+    def bounded_subset(dataset):
+        use_n = min(max_samples, len(dataset))
+        indices = rng.permutation(len(dataset))[:use_n].tolist()
+        return Subset(dataset, indices), indices
 
-    # 按指定比例划分训练/验证
-    train_N = int(len(working_dataset) * (1.0 - val_ratio))
-    val_N = len(working_dataset) - train_N
-    if train_N < 1 or val_N < 1:
-        raise RuntimeError('Not enough samples for train/val split')
-
-    split_generator = torch.Generator().manual_seed(seed)
-    train_dataset, val_dataset = random_split(
-        working_dataset, [train_N, val_N], generator=split_generator
-    )
+    train_dataset, train_indices = bounded_subset(full_train_dataset)
+    val_dataset, val_indices = bounded_subset(full_val_dataset)
+    train_N = len(train_dataset)
+    val_N = len(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    print(f"Small experiment: total_used={len(working_dataset)}, train={train_N}, val={val_N}")
+    print(f"Small experiment: train={train_N}, val={val_N} (bounded independently)")
 
     # 计算训练集全局 IMU per-channel 均值/方差（用于统一归一化）
     try:
@@ -1167,11 +1153,12 @@ def run_small_scale_experiment(data_dirs,
     save_json(
         os.path.join(output_dir, "split_manifest.json"),
         {
-            "strategy": "legacy_random_sample_split",
+            "strategy": "trajectory_directory_split_with_bounded_sampling",
             "seed": seed,
-            "selected_source_indices": indices,
-            "train_working_indices": list(train_dataset.indices),
-            "val_working_indices": list(val_dataset.indices),
+            "train_dirs": train_dirs,
+            "val_dirs": val_dirs,
+            "train_source_indices": train_indices,
+            "val_source_indices": val_indices,
         },
     )
 
@@ -1402,17 +1389,25 @@ def parse_args():
     parser.add_argument("--small", action="store_true", help="run a bounded diagnostic experiment")
     parser.add_argument("--data-root", default=os.path.join(repo_root, "data_lj"))
     parser.add_argument(
-        "--data-dirs",
+        "--train-dirs",
         nargs="+",
-        default=["data013325", "data065517", "data090854", "data212832"],
-        help="dataset directory names relative to --data-root",
+        default=["data065517", "data090854", "data122041"],
+        help="complete training trajectory directories relative to --data-root",
+    )
+    parser.add_argument(
+        "--val-dirs",
+        nargs="+",
+        default=["data212832"],
+        help="complete validation trajectory directories relative to --data-root",
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--seq-len", type=int, default=100)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--max-samples", type=int, default=200, help="used only with --small")
+    parser.add_argument(
+        "--max-samples", type=int, default=200,
+        help="maximum samples selected independently from train and validation sets; used only with --small",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--output-root", default=os.path.join(repo_root, "runs"))
@@ -1429,24 +1424,30 @@ def build_runtime_config(args):
     epochs = args.epochs if args.epochs is not None else (5 if small else 50)
     batch_size = args.batch_size if args.batch_size is not None else (8 if small else 32)
     learning_rate = args.learning_rate if args.learning_rate is not None else (1e-4 if small else 5e-3)
-    if not 0.0 < args.val_ratio < 1.0:
-        raise ValueError("--val-ratio must be between 0 and 1")
     if epochs < 1 or batch_size < 1 or args.seq_len < 1 or args.max_samples < 2:
         raise ValueError("epochs, batch size and seq length must be positive; max samples must be >= 2")
-    data_dirs = resolve_data_dirs(args.data_root, args.data_dirs)
+    train_dirs = resolve_data_dirs(args.data_root, args.train_dirs)
+    val_dirs = resolve_data_dirs(args.data_root, args.val_dirs)
+    overlap = set(map(os.path.realpath, train_dirs)) & set(map(os.path.realpath, val_dirs))
+    if overlap:
+        raise ValueError(
+            "Training and validation trajectories must be disjoint; overlap: "
+            + ", ".join(sorted(overlap))
+        )
     return {
         "schema_version": 1,
         "mode": "small" if small else "legacy_single_step",
         "scientific_status": "diagnostic_only_pending_100hz_recursive_filter",
         "repo_root": repo_root,
         "data_root": os.path.abspath(os.path.expanduser(args.data_root)),
-        "data_dir_names": list(args.data_dirs),
-        "data_dirs": data_dirs,
+        "train_dir_names": list(args.train_dirs),
+        "val_dir_names": list(args.val_dirs),
+        "train_dirs": train_dirs,
+        "val_dirs": val_dirs,
         "epochs": epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seq_len": args.seq_len,
-        "val_ratio": args.val_ratio,
         "max_samples": args.max_samples,
         "seed": args.seed,
         "device": args.device,
@@ -1479,11 +1480,11 @@ if __name__ == "__main__":
     )
     if cli_args.small:
         run_small_scale_experiment(
-            runtime_config["data_dirs"],
+            runtime_config["train_dirs"],
+            runtime_config["val_dirs"],
             max_samples=runtime_config["max_samples"],
             epochs=runtime_config["epochs"],
             batch_size=runtime_config["batch_size"],
-            val_ratio=runtime_config["val_ratio"],
             learning_rate=runtime_config["learning_rate"],
             seq_len=runtime_config["seq_len"],
             device=resolve_device(runtime_config["device"]),
