@@ -195,6 +195,12 @@ namespace basetk
 		m_bResiChisq = true;
 		m_nState = 0;
 		m_nMeas = 0;
+		//lj修改 2026-08-11：初始化GNSS成功更新区间的累计状态
+		updateTime = 0;
+		m_AccInitialized = false;
+		m_StartNewInterval = true;
+		m_HasSuccessfulGNSSBoundary = false;
+		m_AccStepCount = 0;
 	}
 
 
@@ -272,6 +278,14 @@ namespace basetk
 		m_Ry.freeMatrix();
 		m_KFTmp_F.freeMatrix();
 		m_KFTmp_Q.freeMatrix();
+		//lj修改 2026-08-11：释放GNSS区间累计矩阵成员
+		m_PStart.freeMatrix();
+		m_PhiAcc.freeMatrix();
+		m_QAcc.freeMatrix();
+		m_AccInitialized = false;
+		m_StartNewInterval = true;
+		m_HasSuccessfulGNSSBoundary = false;
+		m_AccStepCount = 0;
 	}
 
 
@@ -319,25 +333,86 @@ namespace basetk
 			m_KFTmp_Q.add2(Qc);
 			m_KFTmp_Q *= (dt*0.5);
 
-			//// lj：输出Q矩阵 用于模型中缩放
-			//// 
-			//static FILE* fp9 = fopen("Q.txt", "w");
-			//if (fp9 && updateTime!=0) {
-			//	static int header_written = 0;
-			//	if (!header_written) {
-			//		fprintf(fp9, "WeekSecond Q\n");
-			//		header_written = 1;
-			//	}
-			//	fprintf(fp9, "%d", updateTime);
-			//	updateTime = 0;
-			//	m_KFTmp_Q.write(fp9);
-			//	fprintf(fp9, "\n");
-			//}
+			//lj修改 2026-08-11：使用实例成员累计相邻两次成功GNSS位置更新之间的传播量
+			if (!m_AccInitialized || m_PStart.row != StateP.row || m_PStart.col != StateP.col)
+			{
+				m_PStart.freeMatrix();
+				m_PhiAcc.freeMatrix();
+				m_QAcc.freeMatrix();
+				m_PStart.mat(StateP.row, StateP.col);
+				m_PhiAcc.mat(Phi.row, Phi.col);
+				m_QAcc.mat(m_KFTmp_Q.row, m_KFTmp_Q.col);
+				m_AccInitialized = true;
+				m_StartNewInterval = true;
+				m_HasSuccessfulGNSSBoundary = false;
+			}
+
+			//lj修改 2026-08-11：成功GNSS更新后的第一次传播以更新后的后验协方差为区间起点
+			if (m_StartNewInterval)
+			{
+				m_PStart = StateP;
+				m_PhiAcc.zero();
+				for (int i = 0; i < m_PhiAcc.row && i < m_PhiAcc.col; i++) m_PhiAcc.at(i, i, 1.0);
+				m_QAcc.zero();
+				m_AccStepCount = 0;
+				m_StartNewInterval = false;
+			}
+
+			// Q_acc,new = Phi_current * Q_acc,old * Phi_current^T + Q_current
+			Mat QAccNew(m_QAcc.row, m_QAcc.col);
+			MatrixMultiply_HPHT(Phi.row, Phi.col, Phi.x, m_QAcc.x, false, QAccNew.x);
+			QAccNew.add2(m_KFTmp_Q);
+			m_QAcc = QAccNew;
+
+			// Phi_acc,new = Phi_current * Phi_acc,old (order must not be reversed)
+			Mat PhiAccNew(m_PhiAcc.row, m_PhiAcc.col);
+			PhiAccNew.multiply(Phi, m_PhiAcc);
+			m_PhiAcc = PhiAccNew;
+			m_AccStepCount++;
 
 			// Pp = Phi*P*Phi_T + Q
 			MatrixMultiply_HPHT(Phi.row, Phi.col, Phi.x, StateP.x, false, StatePPre.x);
 			StatePPre.add2(m_KFTmp_Q);
+
 		}
+	}
+
+
+	//lj修改 2026-08-11：仅在GNSS位置更新成功后输出并结束当前累计区间
+	void CGLSEstimator::FinishGNSSInterval(Mat PPred)
+	{
+		if (!m_AccInitialized || updateTime == 0) return;
+
+		// 第一次成功GNSS更新仅建立起始边界，不输出启动阶段的不完整区间。
+		if (m_HasSuccessfulGNSSBoundary)
+		{
+			static FILE* fpPStart = fopen("PStart.txt", "w");
+			static FILE* fpPhiAcc = fopen("PhiAcc.txt", "w");
+			static FILE* fpQAcc = fopen("QAcc.txt", "w");
+			static FILE* fpPPredCpp = fopen("PPredCpp.txt", "w");
+			static FILE* fpAccMeta = fopen("AccMeta.txt", "w");
+			static int headerWritten = 0;
+
+			if (!headerWritten)
+			{
+				if (fpPStart) fprintf(fpPStart, "WeekSecond PStart\n");
+				if (fpPhiAcc) fprintf(fpPhiAcc, "WeekSecond PhiAcc\n");
+				if (fpQAcc) fprintf(fpQAcc, "WeekSecond QAcc\n");
+				if (fpPPredCpp) fprintf(fpPPredCpp, "WeekSecond PPredCpp\n");
+				if (fpAccMeta) fprintf(fpAccMeta, "WeekSecond StepCount\n");
+				headerWritten = 1;
+			}
+
+			if (fpPStart) { fprintf(fpPStart, "%d", updateTime); m_PStart.write(fpPStart); fprintf(fpPStart, "\n"); }
+			if (fpPhiAcc) { fprintf(fpPhiAcc, "%d", updateTime); m_PhiAcc.write(fpPhiAcc); fprintf(fpPhiAcc, "\n"); }
+			if (fpQAcc) { fprintf(fpQAcc, "%d", updateTime); m_QAcc.write(fpQAcc); fprintf(fpQAcc, "\n"); }
+			if (fpPPredCpp) { fprintf(fpPPredCpp, "%d", updateTime); PPred.write(fpPPredCpp); fprintf(fpPPredCpp, "\n"); }
+			if (fpAccMeta) fprintf(fpAccMeta, "%d %d\n", updateTime, m_AccStepCount);
+		}
+
+		m_HasSuccessfulGNSSBoundary = true;
+		m_StartNewInterval = true;
+		updateTime = 0;
 	}
 
 

@@ -151,7 +151,7 @@ def main(config):
     # 快速自检：打印第一个训练批次的 Q_origin 对角线统计与 pos_true 量级，并可运行 single-batch overfit
     try:
         sample_batch = next(iter(train_loader))
-        sb_Q_origin = sample_batch["Q"].to(device).float()
+        sb_Q_origin = sample_batch["Q_acc"].to(device).float()
         try:
             sb_Q_diag = sb_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
         except Exception:
@@ -177,7 +177,7 @@ def main(config):
             print("[QC] Running single-batch overfit to Q_origin diagonal (steps=", OVERFIT_STEPS, ")...")
             model.train()
             o_imu = sample_batch["imu"].to(device).float()
-            o_P = sample_batch["P"].to(device).float()
+            o_P = sample_batch["P_start"].to(device).float()
             o_Q_origin = sb_Q_origin
             try:
                 target_diag = o_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
@@ -308,13 +308,13 @@ def main(config):
                     pass
 
             # 构造 Kalman 需要的矩阵
-            phi = batch["phi"].to(device).float()
+            phi = batch["Phi_acc"].to(device).float()
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
-            P = batch["P"].to(device).float()
-            stateX = batch["stateX"].to(device).float()
-            Q_origin = batch["Q"].to(device).float()
+            P = batch["P_start"].to(device).float()
+            stateX = batch["state_pred"].to(device).float()
+            Q_origin = batch["Q_acc"].to(device).float()
 
 
             # 网络预测 Q 的对角线元素
@@ -468,13 +468,13 @@ def main(config):
                 except Exception:
                     pass
 
-                v_phi = vbatch["phi"].to(device).float()
+                v_phi = vbatch["Phi_acc"].to(device).float()
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
-                v_P = vbatch["P"].to(device).float()
-                v_stateX = vbatch["stateX"].to(device).float()
-                v_Q_origin = vbatch["Q"].to(device).float()
+                v_P = vbatch["P_start"].to(device).float()
+                v_stateX = vbatch["state_pred"].to(device).float()
+                v_Q_origin = vbatch["Q_acc"].to(device).float()
 
                 v_Q_diag_float = model(v_imu.to(torch.float32), v_P.unsqueeze(-1).to(torch.float32))
                 v_Q_diag_float = torch.nn.functional.softplus(v_Q_diag_float) + 1.0
@@ -599,7 +599,7 @@ def main(config):
                 tbatch = tb
                 t_imu = tbatch["imu"].to(device).float()
                 t_pos_true = tbatch["pos_true"].to(device).float()
-                t_P = tbatch["P"].to(device).float()
+                t_P = tbatch["P_start"].to(device).float()
 
                 # ====== 新增：应用训练时相同的归一化到 TrainOut 阶段 ======
                 try:
@@ -611,7 +611,7 @@ def main(config):
                 t_Q_diag = torch.nn.functional.softplus(t_Q_diag)
                 # 放大用于 TrainOut 的 Q_diag
                 t_Q_diag = t_Q_diag * SCALE_Q
-                t_pos_predict = kalman_filter(tbatch["phi"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["stateX"].to(device).float(), t_Q_diag, tbatch["Q"].to(device).float())
+                t_pos_predict = kalman_filter(tbatch["Phi_acc"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P_start"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["state_pred"].to(device).float(), t_Q_diag, tbatch["Q_acc"].to(device).float())
                 all_train_preds.append(t_pos_predict.cpu().numpy())
                 all_train_trues.append(t_pos_true.cpu().numpy())
         if all_train_preds:
@@ -841,8 +841,10 @@ class IMUDataset(utils.IMUDataset):
     pass
 
 
-def kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin):
-    return utils.kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
+def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin):
+    return utils.kalman_filter(
+        Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin
+    )
 
 
 def check_time_alignment(data_dir):
@@ -1190,8 +1192,8 @@ def run_small_scale_experiment(train_dirs,
             obatch = None
         if obatch is not None:
             o_imu = obatch["imu"].to(device).float()
-            o_P = obatch["P"].to(device).float()
-            o_Q_origin = obatch["Q"].to(device).float()
+            o_P = obatch["P_start"].to(device).float()
+            o_Q_origin = obatch["Q_acc"].to(device).float()
 
             # 目标：使用 Q_origin 的对角线作为网络目标，形状 (B, D)
             try:
@@ -1245,13 +1247,13 @@ def run_small_scale_experiment(train_dirs,
             pos_true = batch["pos_true"].to(device).float()
             imu = (imu - imu_mean_tensor) / imu_std_tensor
 
-            phi = batch["phi"].to(device).float()
+            phi = batch["Phi_acc"].to(device).float()
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
-            P = batch["P"].to(device).float()
-            stateX = batch["stateX"].to(device).float()
-            Q_origin = batch["Q"].to(device).float()
+            P = batch["P_start"].to(device).float()
+            stateX = batch["state_pred"].to(device).float()
+            Q_origin = batch["Q_acc"].to(device).float()
 
 
             # 网络预测 Q 的对角线元素
@@ -1337,13 +1339,13 @@ def run_small_scale_experiment(train_dirs,
                 v_pos_true = vbatch["pos_true"].to(device).float()
                 v_imu = (v_imu - imu_mean_tensor) / imu_std_tensor
 
-                v_phi = vbatch["phi"].to(device).float()
+                v_phi = vbatch["Phi_acc"].to(device).float()
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
-                v_P = vbatch["P"].to(device).float()
-                v_stateX = vbatch["stateX"].to(device).float()
-                v_Q_origin = vbatch["Q"].to(device).float()
+                v_P = vbatch["P_start"].to(device).float()
+                v_stateX = vbatch["state_pred"].to(device).float()
+                v_Q_origin = vbatch["Q_acc"].to(device).float()
 
                 v_Q_diag = model(v_imu, v_P.unsqueeze(-1))
                 v_Q_diag = torch.nn.functional.softplus(v_Q_diag)
@@ -1383,7 +1385,7 @@ def parse_args():
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser = argparse.ArgumentParser(
-        description="A-KIT legacy single-step training entry point",
+        description="A-KIT GNSS-interval equivalent-Q training entry point",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--small", action="store_true", help="run a bounded diagnostic experiment")
@@ -1436,8 +1438,8 @@ def build_runtime_config(args):
         )
     return {
         "schema_version": 1,
-        "mode": "small" if small else "legacy_single_step",
-        "scientific_status": "diagnostic_only_pending_100hz_recursive_filter",
+        "mode": "small" if small else "gnss_interval_equivalent_q",
+        "scientific_status": "gnss_interval_equivalent_q",
         "repo_root": repo_root,
         "data_root": os.path.abspath(os.path.expanduser(args.data_root)),
         "train_dir_names": list(args.train_dirs),
@@ -1475,8 +1477,7 @@ if __name__ == "__main__":
     cli_args = parse_args()
     runtime_config = build_runtime_config(cli_args)
     print(
-        "WARNING: this entry point still uses independent 1 Hz single-step Kalman samples; "
-        "it is for engineering diagnostics, not final navigation accuracy conclusions."
+        "A-KIT: using one GNSS-interval Phi_acc/P_start/Q_acc covariance prediction per sample."
     )
     if cli_args.small:
         run_small_scale_experiment(

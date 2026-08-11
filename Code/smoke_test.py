@@ -48,6 +48,8 @@ def main() -> None:
 
     imu = torch.randn(batch, 9, 100, device=device, dtype=torch.float64)
     phi = torch.eye(state_dim, dtype=torch.float64).repeat(batch, 1, 1)
+    # A non-identity accumulated transition catches accidental second state propagation.
+    phi[:, 0, 0] = 2.0
     h = torch.zeros(batch, 3, state_dim, dtype=torch.float64)
     h[:, :, :3] = torch.eye(3, dtype=torch.float64)
     r = torch.eye(3, dtype=torch.float64).repeat(batch, 1, 1) * 0.1
@@ -58,6 +60,9 @@ def main() -> None:
 
     q_scale = torch.nn.functional.softplus(model(imu, p.unsqueeze(-1)))
     prediction = module.kalman_filter(phi, h, r, p, innovation, state, q_scale, q_origin)
+    zero_innovation_prediction = module.kalman_filter(
+        phi, h, r, p, torch.zeros_like(innovation), state, q_scale, q_origin
+    )
     target = prediction.detach() + 0.01
     loss = torch.mean((prediction - target) ** 2)
 
@@ -68,6 +73,8 @@ def main() -> None:
     )
     if prediction.shape != (batch, 3):
         raise AssertionError(f"Unexpected prediction shape: {tuple(prediction.shape)}")
+    if not torch.allclose(zero_innovation_prediction, state[:, :3, 0]):
+        raise AssertionError("state_pred was propagated by Phi_acc more than zero times")
     if not math.isfinite(float(loss)) or not math.isfinite(float(grad_norm)):
         raise AssertionError("Loss or gradient is not finite")
     if float(grad_norm) <= 0.0:

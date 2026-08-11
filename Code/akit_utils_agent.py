@@ -119,7 +119,7 @@ def load_matrix_file(file_path, rows, cols):
 
 
 def check_time_alignment(data_dir):
-    required_files = ["imu.txt", "Vel.txt", "Inno.txt", "Phi.txt", "H.txt", "R.txt", "StateP.txt", "StateX_new.txt", "Q.txt"]
+    required_files = ["imu.txt", "Vel.txt", "Inno.txt", "PhiAcc.txt", "H.txt", "R.txt", "PStart.txt", "NominalState_prior.txt", "QAcc.txt"]
     for file in required_files:
         file_path = os.path.join(data_dir, file)
         if not os.path.exists(file_path):
@@ -161,27 +161,27 @@ class MultiDatasetIMU(Dataset):
             raise FileNotFoundError(f"No position reference file found in {data_dir}")
         pos_file = os.path.join(data_dir, pos_files[0])
         matrix_files = {
-            "phi": os.path.join(data_dir, "Phi.txt"),
+            "phi_acc": os.path.join(data_dir, "PhiAcc.txt"),
             "H": os.path.join(data_dir, "H.txt"),
             "R": os.path.join(data_dir, "R.txt"),
-            "P": os.path.join(data_dir, "StateP.txt"),
-            "state": os.path.join(data_dir, "StateX_new.txt"),
+            "P_start": os.path.join(data_dir, "PStart.txt"),
+            "state": os.path.join(data_dir, "NominalState_prior.txt"),
             "inno": os.path.join(data_dir, "Inno.txt"),
-            "Q": os.path.join(data_dir, "Q.txt")
+            "Q_acc": os.path.join(data_dir, "QAcc.txt")
         }
         imu_second_data, imu_timestamps = self._load_and_group_imu_data(imu_file, 6)
         vel_second_data = self._load_vel_data_by_imu_timestamps(vel_file, imu_timestamps, 3)
         common_seconds = set(imu_second_data.keys()) & set(vel_second_data.keys())
         print(f"Found {len(common_seconds)} seconds with complete 100Hz data")
         pos_dict = load_truePos(pos_file)
-        phi_dict = load_matrix_file(matrix_files["phi"], 15, 15) if os.path.exists(matrix_files["phi"]) else {}
+        phi_dict = load_matrix_file(matrix_files["phi_acc"], 15, 15) if os.path.exists(matrix_files["phi_acc"]) else {}
         H_dict = load_matrix_file(matrix_files["H"], 3, 15) if os.path.exists(matrix_files["H"]) else {}
         R_dict = load_matrix_file(matrix_files["R"], 3, 3) if os.path.exists(matrix_files["R"]) else {}
-        P_dict = load_matrix_file(matrix_files["P"], 15, 15) if os.path.exists(matrix_files["P"]) else {}
+        P_dict = load_matrix_file(matrix_files["P_start"], 15, 15) if os.path.exists(matrix_files["P_start"]) else {}
         state_dict = load_matrix_file(matrix_files["state"], 15, 1) if os.path.exists(matrix_files["state"]) else {}
         inno_dict = load_matrix_file(matrix_files["inno"], 3, 1) if os.path.exists(matrix_files["inno"]) else {}
-        Q_dict = load_matrix_file(matrix_files["Q"], 15, 15) if os.path.exists(matrix_files["Q"]) else {}
-        print(f"Matrix data loaded: pos({len(pos_dict)}), phi({len(phi_dict)}), H({len(H_dict)}), R({len(R_dict)}), P({len(P_dict)}), state({len(state_dict)}), inno({len(inno_dict)}), Q({len(Q_dict)})")
+        Q_dict = load_matrix_file(matrix_files["Q_acc"], 15, 15) if os.path.exists(matrix_files["Q_acc"]) else {}
+        print(f"Matrix data loaded: pos({len(pos_dict)}), Phi_acc({len(phi_dict)}), H({len(H_dict)}), R({len(R_dict)}), P_start({len(P_dict)}), state_pred({len(state_dict)}), inno({len(inno_dict)}), Q_acc({len(Q_dict)})")
 
         # --- 新增: 基线对齐（开始） ---
         # 目标：使用 pos_true 与 stateX 的首个对齐时刻作为 baseline，优先精确时间匹配，
@@ -251,13 +251,13 @@ class MultiDatasetIMU(Dataset):
                 "time": float(second),
                 "matrix_time": second,
                 "pos_true": pos_rel,
-                "phi": phi_dict[second],
+                "Phi_acc": phi_dict[second],
                 "H": H_dict[second],
                 "R": R_dict[second],
-                "P": P_dict[second],
-                "stateX": stateX_mat,
+                "P_start": P_dict[second],
+                "state_pred": stateX_mat,
                 "Inno": inno_dict[second],
-                "Q": Q_dict[second],
+                "Q_acc": Q_dict[second],
             }
             samples.append(sample)
         return samples
@@ -357,13 +357,13 @@ class MultiDatasetIMU(Dataset):
             "time": torch.tensor(sample["time"], dtype=torch.float64),
             "matrix_time": torch.tensor(sample["matrix_time"], dtype=torch.float64),
             "pos_true": torch.tensor(sample["pos_true"], dtype=torch.float64),
-            "phi": torch.tensor(sample["phi"], dtype=torch.float64),
+            "Phi_acc": torch.tensor(sample["Phi_acc"], dtype=torch.float64),
             "H": torch.tensor(sample["H"], dtype=torch.float64),
             "R": torch.tensor(sample["R"], dtype=torch.float64),
-            "P": torch.tensor(sample["P"], dtype=torch.float64),
-            "stateX": torch.tensor(sample["stateX"], dtype=torch.float64),
+            "P_start": torch.tensor(sample["P_start"], dtype=torch.float64),
+            "state_pred": torch.tensor(sample["state_pred"], dtype=torch.float64),
             "Inno": torch.tensor(sample["Inno"], dtype=torch.float64),
-            "Q": torch.tensor(sample["Q"], dtype=torch.float64),
+            "Q_acc": torch.tensor(sample["Q_acc"], dtype=torch.float64),
         }
 
 
@@ -376,89 +376,85 @@ class IMUDataset(Dataset):
         return self.multi_dataset[idx]
 
 
-def kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin):
-    """Pure-Torch differentiable single-step Kalman update (batch-aware).
+def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin):
+    """Differentiable GNSS-interval equivalent covariance prediction and update.
     Inputs (batch first):
-      phi: (B, n, n)
+      Phi_acc: (B, n, n) -- transition accumulated over the GNSS interval
       H:   (B, m, n)
       R:   (B, m, m)
-      P:   (B, n, n)
+      P_start: (B, n, n) -- posterior covariance at interval start
       Inno:(B, m, 1)
-      stateX:(B, n, 1)
-      Q_diag:(B, n, n) -- process noise (already expanded to full matrix)
+      state_pred:(B, n, 1) -- state immediately before the GNSS update
+      q_scale:(B, n) -- positive scales for the diagonal of Q_acc_origin
+      Q_acc_origin:(B, n, n) -- equivalent process noise for the whole interval
     Returns:
       pos_predict: (B, 3) -- first 3 components of updated state
     This implementation uses torch operations only and adds small jitter to S diagonal
     for numerical stability. Uses torch.linalg.solve when possible.
     """
     eps = 1e-8
-    device = phi.device
-    dtype = phi.dtype
+    device = Phi_acc.device
+    dtype = Phi_acc.dtype
     # 强制使用 double 精度进行卡尔曼内部计算，避免 float/double mismatch（保留 autograd）
     try:
         target_dtype = torch.float64
-        phi = phi.to(device=device, dtype=target_dtype)
+        Phi_acc = Phi_acc.to(device=device, dtype=target_dtype)
         H = H.to(device=device, dtype=target_dtype)
         R = R.to(device=device, dtype=target_dtype)
-        P = P.to(device=device, dtype=target_dtype)
+        P_start = P_start.to(device=device, dtype=target_dtype)
         Inno = Inno.to(device=device, dtype=target_dtype)
-        if stateX is not None:
-            stateX = stateX.to(device=device, dtype=target_dtype)
-        Q_diag = Q_diag.to(device=device, dtype=target_dtype)
-        Q_origin = Q_origin.to(device=device, dtype=target_dtype)
+        if state_pred is not None:
+            state_pred = state_pred.to(device=device, dtype=target_dtype)
+        q_scale = q_scale.to(device=device, dtype=target_dtype)
+        Q_acc_origin = Q_acc_origin.to(device=device, dtype=target_dtype)
         dtype = target_dtype
     except Exception:
         pass
 
-    # Predict covariance: P_prior = phi * P * phi^T + Q_diag
+    # Build the predicted equivalent Q for the complete GNSS interval.
     try:
             # 支持 Q_diag 为 (B, n)（表示对角缩放因子）或 (B, n, n)（表示与 Q_origin 做按元素缩放）
-        if Q_diag.dim() == 2:
+        if q_scale.dim() == 2:
             # Q_diag 为 (B, n) 时，视为对 Q_origin 对角线的缩放因子。
             # 为保留 autograd 路径，避免对张量做 in-place 写操作。
             # 提取 Q_origin 的对角并按 Q_diag 缩放，然后重建一个对角矩阵并与 Q_origin 的非对角部分合并。
             # diag_orig: (B, n)
             try:
-                diag_orig = Q_origin.diagonal(offset=0, dim1=-2, dim2=-1)
+                diag_orig = Q_acc_origin.diagonal(offset=0, dim1=-2, dim2=-1)
             except Exception:
                 # 兼容较旧 PyTorch 版本的接口
-                diag_orig = torch.stack([torch.diagonal(m) for m in Q_origin], dim=0)
+                diag_orig = torch.stack([torch.diagonal(m) for m in Q_acc_origin], dim=0)
             # 构造缩放后的对角线（保留 autograd 路径）
-            scaled_diag = diag_orig * Q_diag
+            scaled_diag = diag_orig * q_scale
             # 构造对角矩阵 (B, n, n) - 现在整个 Q 矩阵都与 Q_diag 相关
             Q_effective = torch.diag_embed(scaled_diag)
             # 注意：这里我们不再保留原始的非对角部分，让网络学习完整的 Q 矩阵
             # --- 调试：检查计算图 ---
-            if torch.is_grad_enabled() and Q_diag.requires_grad:
+            if torch.is_grad_enabled() and q_scale.requires_grad:
                 # 确保计算图连接
                 pass
-        elif Q_diag.dim() == 3 and Q_diag.shape == Q_origin.shape:
+        elif q_scale.dim() == 3 and q_scale.shape == Q_acc_origin.shape:
             # 如果提供的是与 Q_origin 形状相同的矩阵，则按元素相乘（保留用户意图）
-            Q_effective = Q_origin * Q_diag
+            Q_effective = Q_acc_origin * q_scale
         else:
             # 明确报错，避免静默兼容导致难以发现的问题
-            raise ValueError(f"Unexpected Q_diag shape: {tuple(Q_diag.shape)}; expected (B,n) or (B,n,n) matching Q_origin {tuple(Q_origin.shape)}")
+            raise ValueError(f"Unexpected q_scale shape: {tuple(q_scale.shape)}; expected (B,n) or (B,n,n) matching Q_acc_origin {tuple(Q_acc_origin.shape)}")
     except Exception as e:
         # 抛出运行时错误以便上层可以捕获并定位问题
-        raise RuntimeError(f"Failed to construct Q_effective from Q_diag: {e}")
+        raise RuntimeError(f"Failed to construct Q_acc_pred from q_scale: {e}")
 
     # 支持 H/R 为非批量（广播）
     if H.dim() == 2:
-        H = H.unsqueeze(0).expand(P.shape[0], -1, -1)
+        H = H.unsqueeze(0).expand(P_start.shape[0], -1, -1)
     if R.dim() == 2:
-        R = R.unsqueeze(0).expand(P.shape[0], -1, -1)
+        R = R.unsqueeze(0).expand(P_start.shape[0], -1, -1)
 
-    # 支持 phi 为非批量（广播），并计算先验协方差 P_prior = phi P phi^T + Q_effective
-    if phi.dim() == 2:
-        phi = phi.unsqueeze(0).expand(P.shape[0], -1, -1)
-        # 先验协方差（恢复原有公式）
-    P_pred = torch.matmul(torch.matmul(phi, P), phi.transpose(-2, -1)) + Q_effective
-        # 预测 state（若需要）：state_pred = phi @ stateX
-    try:
-        if stateX is not None and stateX.dim() == 3:
-            state_pred = torch.matmul(phi, stateX)
-    except Exception:
-        pass
+    # Phi_acc may be unbatched; P_start is propagated exactly once for this interval.
+    if Phi_acc.dim() == 2:
+        Phi_acc = Phi_acc.unsqueeze(0).expand(P_start.shape[0], -1, -1)
+    # Exactly one interval-level prediction. Q_acc_pred must not be recursively added.
+    P_base = torch.matmul(torch.matmul(Phi_acc, P_start), Phi_acc.transpose(-2, -1))
+    P_pred = P_base + Q_effective
 
     # 使用先验协方差进行更新
     HP = torch.matmul(H, P_pred)           # (B, m, n)
@@ -479,11 +475,10 @@ def kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin):
     state_post = state_pred + state_update
 
     # ====== 合并后的精简 DEBUG 打印 (仅打印第一个样本的前3维) ======
-    if stateX is not None and 'state_pred' in locals():
+    if state_pred is not None:
         try:
             with torch.no_grad():
                 # 提取数据
-                s_ori = stateX[0, :3, 0].cpu().numpy()
                 s_pre = state_pred[0, :3, 0].cpu().numpy()
                 s_upd = state_update[0, :3, 0].cpu().numpy()
                 s_pst = state_post[0, :3, 0].cpu().numpy()
@@ -492,13 +487,13 @@ def kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin):
                 fmt = lambda x: "[" + ",".join([f"{v:.4f}" for v in x]) + "]"
                 
                 # 单行打印核心链路
-                print(f"DEBUG KF [Pos]: Ori:{fmt(s_ori)} -> Pre:{fmt(s_pre)} + Upd:{fmt(s_upd)} = Pst:{fmt(s_pst)}")
+                print(f"DEBUG KF [Pos]: Pre:{fmt(s_pre)} + Upd:{fmt(s_upd)} = Pst:{fmt(s_pst)}")
         except Exception as e:
             print(f"DEBUG KF: Print failed ({e})")
     # ==========================================================
 
     # Joseph form 保证数值稳定并保持半正定
-    I = torch.eye(P.shape[-1], device=device, dtype=dtype).unsqueeze(0).expand(P.shape[0], -1, -1)
+    I = torch.eye(P_start.shape[-1], device=device, dtype=dtype).unsqueeze(0).expand(P_start.shape[0], -1, -1)
     KH = torch.matmul(K, H)  # (B, n, n)
     temp = I - KH
     P_post = torch.matmul(torch.matmul(temp, P_pred), temp.transpose(-2, -1)) + torch.matmul(torch.matmul(K, R), K.transpose(-2, -1))

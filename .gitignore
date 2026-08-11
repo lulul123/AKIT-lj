@@ -1,6 +1,9 @@
 # 本地数据，不上传
 data_lj/
 
+# 本地参考源码，不上传
+referance/
+
 # Python 缓存
 __pycache__/
 *.pyc

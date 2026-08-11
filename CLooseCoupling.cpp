@@ -244,9 +244,7 @@ namespace sinstk
 		//	m_GLSInfo.SINSPhi.write(fp4);
 		//	fprintf(fp4, "\n");
 		//}
-		// GPSTIME
-		if(m_UpdateTime.fracOfSec <= 0.00) m_GLS.updateTime = m_UpdateTime.secsOfWeek;
-		
+		//lj修改 2026-08-11：不再按整数秒结束累计区间，改由成功GNSS位置更新触发
 		m_GLS.KFPrediction(m_SINSMech.m_DeltTime, m_GLSInfo.SINSCF, m_GLSInfo.SINSQc, m_GLSInfo.StateP, m_GLSInfo.SINSPhi, m_GLSInfo.SINSPPre);
 		m_GLSInfo.StateP = m_GLSInfo.SINSPPre;
 
@@ -788,6 +786,13 @@ namespace sinstk
 		else
 		{
 			setMEQ(0, ELCType); // 得到位置的验后残差
+		}
+
+		//lj修改 2026-08-11：只有通过质控的GNSS位置更新才结束并输出累计区间
+		if (bPassUPT && (ELCType&ELCTYPE_POS))
+		{
+			m_GLS.updateTime = m_UpdateTime.secsOfWeek;
+			m_GLS.FinishGNSSInterval(m_GLSInfo.SINSPPre);
 		}
 
 		m_pSINSSol->m_IMUFlag = ELCType;
