@@ -5,6 +5,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "True")
 # 限制线程数以降低不同库间线程冲突的
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/akit-matplotlib")
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,15 @@ matplotlib.use('Agg')  # 使用非交互式后端
 from datetime import datetime
 import time
 import akit_utils_agent as utils
+from akit_runtime import (
+    checkpoint_payload,
+    collect_environment,
+    create_output_dir,
+    resolve_data_dirs,
+    resolve_device,
+    save_json,
+    set_reproducible_seed,
+)
 
 
 # 控制输出开关（将不需要的输出设为 False）
@@ -30,46 +40,42 @@ SAVE_DETAILED_ANALYSIS = False     # 是否生成 detailed_analysis.png
 SCALE_Q = 1.0
 
 
-def main():
-    # ====== 新增：随机种子 ======
-    torch.manual_seed(42)
-    np.random.seed(42)
+def main(config):
+    set_reproducible_seed(config["seed"])
 
-    # 1. 训练超参数
-    batch_size = 32
-    seq_len = 100  # IMU(t-99 ~ t) → 预测 Q(t)
-    epochs = 50
-    learning_rate = 5e-3
+    batch_size = config["batch_size"]
+    seq_len = config["seq_len"]
+    epochs = config["epochs"]
+    learning_rate = config["learning_rate"]
+    device = resolve_device(config["device"])
+    train_dirs = config["train_dirs"]
+    val_dirs = config["val_dirs"]
+    output_dir = str(create_output_dir(config["output_root"], config["experiment_name"]))
+    save_json(os.path.join(output_dir, "config.json"), config)
+    save_json(os.path.join(output_dir, "environment.json"), collect_environment(config["repo_root"]))
+    print(f"Device: {device}")
+    print(f"Experiment outputs: {output_dir}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-     
-    # 2. 多数据集路径 - 使用绝对路径
-    base_path = r"F:\AAA-lulul\科研工作\毕业设计\A-KIT-main\A-KIT-main\data_lj"
-    data_dirs = [
-        os.path.join(base_path, "data013325"),
-        os.path.join(base_path, "data065517"),
-        os.path.join(base_path, "data090854"),
-        os.path.join(base_path, "data212832")
-    ]
-    
-    # 检查数据路径（静默检查，仅在必须时抛出）
-    for data_dir in data_dirs:
-        if not os.path.exists(data_dir):
-            raise FileNotFoundError(f"数据路径不存在: {data_dir}")
-
-    # 创建多数据集加载器
-    # 合并所有 data_dirs 后按比例划分训练/验证（80/20）
-    print("=> 合并数据集并按 80/20 划分训练/验证")
-    combined_dataset = MultiDatasetIMU(data_dirs, seq_len=seq_len)
-    total_N = len(combined_dataset)
-    if total_N == 0:
-        raise RuntimeError("No samples found in combined datasets")
-    train_N = int(total_N * 0.8)
-    val_N = total_N - train_N
-    from torch.utils.data import random_split
-    train_dataset, val_dataset = random_split(combined_dataset, [train_N, val_N])
+    # 每个目录代表一条完整轨迹。训练集和验证集分别加载，避免相邻秒泄漏。
+    print("=> 按完整轨迹加载训练集和验证集")
+    train_dataset = MultiDatasetIMU(train_dirs, seq_len=seq_len)
+    val_dataset = MultiDatasetIMU(val_dirs, seq_len=seq_len)
+    train_N = len(train_dataset)
+    val_N = len(val_dataset)
+    if train_N == 0 or val_N == 0:
+        raise RuntimeError("No samples found in train or validation trajectories")
+    save_json(
+        os.path.join(output_dir, "split_manifest.json"),
+        {
+            "strategy": "trajectory_directory_split",
+            "train_dirs": train_dirs,
+            "val_dirs": val_dirs,
+            "train_samples": train_N,
+            "val_samples": val_N,
+        },
+    )
     # 打印数据读取相关摘要（保留）
-    print(f"Total samples: {total_N}, Train: {train_N}, Val: {val_N}")
+    print(f"Total samples: {train_N + val_N}, Train: {train_N}, Val: {val_N}")
 
     # 计算训练集全局 IMU per-channel 均值/方差（用于统一归一化）
     try:
@@ -122,9 +128,9 @@ def main():
 
     # ========== 快速自检配置 ==========
     # 若为 True，训练前会对第一个训练批次运行 single-batch overfit 来拟合 Q_origin 的对角线
-    RUN_OVERFIT_MAIN = True
-    OVERFIT_STEPS = 200
-    OVERFIT_LR = 1e-3
+    RUN_OVERFIT_MAIN = config["run_overfit"]
+    OVERFIT_STEPS = config["overfit_steps"]
+    OVERFIT_LR = config["overfit_lr"]
     # ========== 结束配置 ==========
 
     # 3. 构建模型
@@ -145,7 +151,7 @@ def main():
     # 快速自检：打印第一个训练批次的 Q_origin 对角线统计与 pos_true 量级，并可运行 single-batch overfit
     try:
         sample_batch = next(iter(train_loader))
-        sb_Q_origin = sample_batch["Q"].to(device).float()
+        sb_Q_origin = sample_batch["Q_acc"].to(device).float()
         try:
             sb_Q_diag = sb_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
         except Exception:
@@ -171,7 +177,7 @@ def main():
             print("[QC] Running single-batch overfit to Q_origin diagonal (steps=", OVERFIT_STEPS, ")...")
             model.train()
             o_imu = sample_batch["imu"].to(device).float()
-            o_P = sample_batch["P"].to(device).float()
+            o_P = sample_batch["P_start"].to(device).float()
             o_Q_origin = sb_Q_origin
             try:
                 target_diag = o_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
@@ -215,7 +221,7 @@ def main():
             print(f" [Diag] Param[{i}] registered in optimizer: {in_opt}")
     except Exception as _:
         pass
-    
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -223,11 +229,6 @@ def main():
         patience=5,
         verbose=True
     )
-
-    # 创建输出目录（不打印路径以减少输出）
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"training_results_{timestamp}"
-    os.makedirs(output_dir, exist_ok=True)
 
     # 新增：创建每批/每轮监控文件
     batch_metrics_path = os.path.join(output_dir, 'batch_metrics.csv')
@@ -247,7 +248,7 @@ def main():
     except Exception:
         pass
     # print(f"训练结果将保存到: {output_dir}")
-    
+
     # 训练监控变量
     train_losses = []
     val_losses = []
@@ -256,16 +257,16 @@ def main():
     learning_rates = []
     q_predictions = []
     position_errors = []
-    
+
     # 在输出目录创建训练日志文件
     test_log_path = os.path.join(output_dir, 'Test.txt')
     with open(test_log_path, 'w', encoding='utf-8') as f:
         f.write('epoch\ttrain_loss\tval_loss\n')
-    
+
     # 5. 训练循环
     # 仅在每个 epoch 打印训练损失
     start_time = time.time()
-    
+
     # ====== 新增：Early Stopping ======
     best_val_loss = float('inf')
     patience = 10
@@ -284,7 +285,7 @@ def main():
             # 读取输入
             imu = batch["imu"].to(device).float()
             pos_true = batch["pos_true"].to(device).float()
-             
+
 
             # ====== 新增：归一化 ======
             # 使用训练集统计量做归一化
@@ -307,22 +308,22 @@ def main():
                     pass
 
             # 构造 Kalman 需要的矩阵
-            phi = batch["phi"].to(device).float()
+            phi = batch["Phi_acc"].to(device).float()
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
-            P = batch["P"].to(device).float()
-            stateX = batch["stateX"].to(device).float()
-            Q_origin = batch["Q"].to(device).float()
-             
+            P = batch["P_start"].to(device).float()
+            stateX = batch["state_pred"].to(device).float()
+            Q_origin = batch["Q_acc"].to(device).float()
+
 
             # 网络预测 Q 的对角线元素
             # 1. 网络预测 Q 的对角线元素 (此时是 Float)
             Q_diag_float = model(imu.to(torch.float32), P.unsqueeze(-1).to(torch.float32))
-            
+
             # 使用 softplus 保证为正且更稳定，但添加偏置避免太小
             Q_diag_float = torch.nn.functional.softplus(Q_diag_float) + 1.0  # 添加偏置
-            
+
             # 2. 【关键修改】显式转为 Double 以便进入卡尔曼滤波
             # 这样在 backward 时，PyTorch 会自动处理从 Double 到 Float 的梯度类型转换
             # 增大缩放因子以增强梯度信号
@@ -336,7 +337,7 @@ def main():
                     print(f"DEBUG: Param[{i}] requires_grad={p.requires_grad} shape={tuple(p.shape)}")
             except Exception:
                 pass
-            
+
             # --- 实时监控 Q 分布（每批） ---
             try:
                 with torch.no_grad():
@@ -353,10 +354,10 @@ def main():
             if torch.isnan(Q_diag).any():
                 print("🧨 DETECTED NaN in Q_diag! Training stopped.")
                 break
-            
+
             # 直接传入 Q_diag (B,n) 由 kalman_filter 内部处理为对角缩放或按元素矩阵
             pos_predict = kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
-            
+
             # --- 诊断：检查 pos_predict 是否与 Q_diag 相关 ---
             # 只在第一个batch检查
             if batch_idx == 0:
@@ -369,22 +370,22 @@ def main():
                             print("WARNING: pos_predict has NO grad_fn! Graph may be broken")
                 except Exception:
                     pass
-             
+
             # --- 计算 Loss (直接位置误差) ---
             # 明确取前 3 列，并确保是 float64
-            pos_true_xyz = pos_true[:, :3].to(torch.float64) 
-            
+            pos_true_xyz = pos_true[:, :3].to(torch.float64)
+
             # 直接计算位置误差损失
             loss = nn.MSELoss()(pos_predict, pos_true_xyz)
             # -----------------------
-            
+
             # 计算位置误差（米）
             pos_error = torch.sqrt(torch.mean((pos_predict - pos_true) ** 2, dim=1))
-            
+
             # 反向传播（真正更新梯度）
             optimizer.zero_grad()
             loss.backward()
-            
+
             # --- 梯度监控：检查关键参数的梯度 ---
             if batch_idx % 10 == 0:
                 try:
@@ -392,7 +393,7 @@ def main():
                     if Q_diag_float.grad is not None:
                         grad_norm_q = torch.norm(Q_diag_float.grad).item()
                         print(f"Grad monitor: Q_diag_float grad norm = {grad_norm_q:.6e}")
-                    
+
                     # 检查模型参数的梯度
                     total_grad_norm = 0.0
                     for name, param in model.named_parameters():
@@ -408,7 +409,7 @@ def main():
             # --- 3. 梯度裁剪与监控 (合并为一个操作，提高效率) ---
             # clip_grad_norm_ 会返回裁剪前的总梯度范数，直接利用它做监控，不要自己写循环算
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            total_norm = float(total_norm.item())   
+            total_norm = float(total_norm.item())
             optimizer.step()
 
             # --- 4. 必要的诊断打印 (建议每 10 个 batch 打印一次) ---
@@ -416,7 +417,7 @@ def main():
                 # 只保留最核心的指标
                 pos_error_val = torch.sqrt(torch.mean((pos_predict - pos_true) ** 2)).item()
                 print(f"Batch {batch_idx} | Loss: {loss.item():.6e} | GradNorm: {total_norm:.4e} | PosErr: {pos_error_val:.3f}m")
-                
+
                 if total_norm == 0.0:
                     print(f"⚠️ Warning: zero gradient at batch {batch_idx}")
 
@@ -441,7 +442,7 @@ def main():
         # 记录epoch统计
         avg_loss = total_loss / len(train_loader)
         epoch_time = time.time() - epoch_start_time
-        
+
         train_losses.append(avg_loss)
         epoch_times.append(epoch_time)
         batch_losses.extend(epoch_batch_losses)
@@ -467,13 +468,13 @@ def main():
                 except Exception:
                     pass
 
-                v_phi = vbatch["phi"].to(device).float()
+                v_phi = vbatch["Phi_acc"].to(device).float()
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
-                v_P = vbatch["P"].to(device).float()
-                v_stateX = vbatch["stateX"].to(device).float()
-                v_Q_origin = vbatch["Q"].to(device).float()
+                v_P = vbatch["P_start"].to(device).float()
+                v_stateX = vbatch["state_pred"].to(device).float()
+                v_Q_origin = vbatch["Q_acc"].to(device).float()
 
                 v_Q_diag_float = model(v_imu.to(torch.float32), v_P.unsqueeze(-1).to(torch.float32))
                 v_Q_diag_float = torch.nn.functional.softplus(v_Q_diag_float) + 1.0
@@ -499,7 +500,7 @@ def main():
 
         # 仅打印每个 epoch 的损失
         print(f"Epoch [{epoch+1}/{epochs}] train_loss={avg_loss:.6f} val_loss={avg_val_loss:.6f} Elapsed: {epoch_time:.2f}s")
-        
+
         # ====== 新增：更新学习率 ======
         scheduler.step(avg_val_loss)
 
@@ -508,8 +509,18 @@ def main():
             best_val_loss = avg_val_loss
             early_stop_counter = 0
 
-            # 保存最优模型
-            torch.save(model.state_dict(), os.path.join(output_dir, "best_model.pth"))
+            torch.save(
+                checkpoint_payload(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    config=config,
+                    epoch=epoch + 1,
+                    metrics={"train_loss": avg_loss, "val_loss": avg_val_loss},
+                    normalization={"imu_mean": imu_mean, "imu_std": imu_std},
+                ),
+                os.path.join(output_dir, "best_model.pth"),
+            )
         else:
             early_stop_counter += 1
 
@@ -547,17 +558,17 @@ def main():
                     plt.close()
                 except Exception:
                     pass
-        
+
         # 保留周期性图表生成但不打印生成信息
         if GENERATE_TRAIN_PROGRESS and (epoch + 1) % 10 == 0:
-            generate_training_plots(train_losses, epoch_times, batch_losses, 
-                                   learning_rates, q_predictions, position_errors, 
+            generate_training_plots(train_losses, epoch_times, batch_losses,
+                                   learning_rates, q_predictions, position_errors,
                                    output_dir, epoch + 1)
 
     # 训练结束后保存最终时间
     total_training_time = time.time() - start_time
     # 已禁用保存整个模型 model.pt；保留 final_model.pth（state_dict + 信息）
-    
+
     # 生成训练与验证 Loss 曲线并保存
     try:
         import matplotlib
@@ -588,7 +599,7 @@ def main():
                 tbatch = tb
                 t_imu = tbatch["imu"].to(device).float()
                 t_pos_true = tbatch["pos_true"].to(device).float()
-                t_P = tbatch["P"].to(device).float()
+                t_P = tbatch["P_start"].to(device).float()
 
                 # ====== 新增：应用训练时相同的归一化到 TrainOut 阶段 ======
                 try:
@@ -600,7 +611,7 @@ def main():
                 t_Q_diag = torch.nn.functional.softplus(t_Q_diag)
                 # 放大用于 TrainOut 的 Q_diag
                 t_Q_diag = t_Q_diag * SCALE_Q
-                t_pos_predict = kalman_filter(tbatch["phi"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["stateX"].to(device).float(), t_Q_diag, tbatch["Q"].to(device).float())
+                t_pos_predict = kalman_filter(tbatch["Phi_acc"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P_start"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["state_pred"].to(device).float(), t_Q_diag, tbatch["Q_acc"].to(device).float())
                 all_train_preds.append(t_pos_predict.cpu().numpy())
                 all_train_trues.append(t_pos_true.cpu().numpy())
         if all_train_preds:
@@ -629,18 +640,29 @@ def main():
     # 生成最终报告与图表
     # 仅在需要时生成详细报告与图表
     if SAVE_DETAILED_ANALYSIS:
-        generate_final_report(model, train_losses, epoch_times, batch_losses, 
-                             learning_rates, q_predictions, position_errors, 
+        generate_final_report(model, train_losses, epoch_times, batch_losses,
+                             learning_rates, q_predictions, position_errors,
                              output_dir, total_training_time, train_dataset)
     else:
         # 仍然保存基本 final_model.pth 信息
         model_path = os.path.join(output_dir, 'final_model.pth')
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'train_losses': train_losses,
-            'total_time': total_training_time,
-            'final_loss': train_losses[-1] if train_losses else 0
-        }, model_path)
+        torch.save(
+            checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                config=config,
+                epoch=len(train_losses),
+                metrics={
+                    "train_losses": train_losses,
+                    "val_losses": val_losses,
+                    "total_time": total_training_time,
+                    "final_loss": train_losses[-1] if train_losses else None,
+                },
+                normalization={"imu_mean": imu_mean, "imu_std": imu_std},
+            ),
+            model_path,
+        )
 
 
 class MultiHeadAttention(nn.Module):
@@ -764,7 +786,7 @@ class SetTransformer(nn.Module):
 class PatchEmbedding(nn.Module):
     def __init__(self, patch_size, filter_size, in_chans, embed_dim):
         super(PatchEmbedding, self).__init__()
-        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=filter_size, 
+        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=filter_size,
                              stride=patch_size, dtype=torch.float32)
 
     def forward(self, x):
@@ -777,11 +799,11 @@ class PatchEmbedding(nn.Module):
 
 
 class Network(nn.Module):
-    def __init__(self, patch_size, filter_size, in_chans, embedding_size, num_heads, 
+    def __init__(self, patch_size, filter_size, in_chans, embedding_size, num_heads,
                  feedforward_expansion, k, blocklayers, output_size):
         super(Network, self).__init__()
         self.PE = PatchEmbedding(patch_size, filter_size, in_chans, embedding_size)
-        self.set_transformer = SetTransformer(embedding_size, num_heads, feedforward_expansion, 
+        self.set_transformer = SetTransformer(embedding_size, num_heads, feedforward_expansion,
                                             k, blocklayers, output_size)
         self.FC_output = nn.Sequential(
             nn.Linear(embedding_size, 32, dtype=torch.float32),
@@ -795,7 +817,7 @@ class Network(nn.Module):
         out = self.set_transformer(x)
         out = out.flatten(1)
         out = self.FC_output(out)
-        
+
         # 确保输出形状是 (batch, 15)，对应15维状态的对角缩放因子
         # 如果 output_size 不是15，需要适配
         return out
@@ -819,23 +841,25 @@ class IMUDataset(utils.IMUDataset):
     pass
 
 
-def kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin):
-    return utils.kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
+def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin):
+    return utils.kalman_filter(
+        Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin
+    )
 
 
 def check_time_alignment(data_dir):
     return utils.check_time_alignment(data_dir)
 
 
-def generate_training_plots(train_losses, epoch_times, batch_losses, 
-                          learning_rates, q_predictions, position_errors, 
+def generate_training_plots(train_losses, epoch_times, batch_losses,
+                          learning_rates, q_predictions, position_errors,
                           output_dir, current_epoch):
     """生成训练过程的可视化图表"""
-    
+
     # 创建子图
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     fig.suptitle(f'Training Progress - Epoch {current_epoch}', fontsize=16)
-    
+
     # 1. Loss收敛曲线
     axes[0, 0].plot(range(1, len(train_losses) + 1), train_losses, 'b-', linewidth=2)
     axes[0, 0].set_title('Training Loss Convergence')
@@ -843,14 +867,14 @@ def generate_training_plots(train_losses, epoch_times, batch_losses,
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_yscale('log')
-    
+
     # 2. 每个epoch的训练时间
     axes[0, 1].bar(range(1, len(epoch_times) + 1), epoch_times, color='green', alpha=0.7)
     axes[0, 1].set_title('Training Time per Epoch')
     axes[0, 1].set_xlabel('Epoch')
     axes[0, 1].set_ylabel('Time (seconds)')
     axes[0, 1].grid(True, alpha=0.3)
-    
+
     # 3. 位置误差分布
     if position_errors:
         axes[0, 2].hist(position_errors, bins=50, color='red', alpha=0.7, edgecolor='black')
@@ -858,15 +882,15 @@ def generate_training_plots(train_losses, epoch_times, batch_losses,
         axes[0, 2].set_xlabel('Position Error (meters)')
         axes[0, 2].set_ylabel('Frequency')
         axes[0, 2].grid(True, alpha=0.3)
-        axes[0, 2].axvline(np.mean(position_errors), color='blue', linestyle='--', 
+        axes[0, 2].axvline(np.mean(position_errors), color='blue', linestyle='--',
                           label=f'Mean: {np.mean(position_errors):.3f}m')
         axes[0, 2].legend()
-    
+
     # 4. Q矩阵对角线元素演化（选择前几个元素）
     if q_predictions:
         q_array = np.array(q_predictions)
         for i in range(min(5, q_array.shape[1])):  # 显示前5个元素
-            axes[1, 0].plot(range(1, len(q_predictions) + 1), q_array[:, i], 
+            axes[1, 0].plot(range(1, len(q_predictions) + 1), q_array[:, i],
                            label=f'Q_{i+1}', linewidth=2)
         axes[1, 0].set_title('Q Matrix Diagonal Elements Evolution')
         axes[1, 0].set_xlabel('Epoch')
@@ -874,7 +898,7 @@ def generate_training_plots(train_losses, epoch_times, batch_losses,
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
         axes[1, 0].set_yscale('log')
-    
+
     # 5. 批次loss变化（最近1000个批次）
     recent_batch_losses = batch_losses[-1000:] if len(batch_losses) > 1000 else batch_losses
     axes[1, 1].plot(recent_batch_losses, 'orange', alpha=0.7, linewidth=1)
@@ -882,7 +906,7 @@ def generate_training_plots(train_losses, epoch_times, batch_losses,
     axes[1, 1].set_xlabel('Recent Batches')
     axes[1, 1].set_ylabel('Loss')
     axes[1, 1].grid(True, alpha=0.3)
-    
+
     # 6. 学习率变化
     axes[1, 2].plot(range(1, len(learning_rates) + 1), learning_rates, 'purple', linewidth=2)
     axes[1, 2].set_title('Learning Rate Schedule')
@@ -890,22 +914,22 @@ def generate_training_plots(train_losses, epoch_times, batch_losses,
     axes[1, 2].set_ylabel('Learning Rate')
     axes[1, 2].grid(True, alpha=0.3)
     axes[1, 2].set_yscale('log')
-    
+
     plt.tight_layout()
-    
+
     # 保存图表
     plot_path = os.path.join(output_dir, f'training_progress_epoch_{current_epoch}.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"训练图表已保存到: {plot_path}")
 
 
-def generate_final_report(model, train_losses, epoch_times, batch_losses, 
-                         learning_rates, q_predictions, position_errors, 
+def generate_final_report(model, train_losses, epoch_times, batch_losses,
+                         learning_rates, q_predictions, position_errors,
                          output_dir, total_training_time, dataset):
     """生成最终训练报告"""
-    
+
     # 1. 保存模型
     model_path = os.path.join(output_dir, 'final_model.pth')
     torch.save({
@@ -914,23 +938,23 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
         'total_time': total_training_time,
         'final_loss': train_losses[-1] if train_losses else 0
     }, model_path)
-    
+
     # 2. 生成最终图表
-    generate_training_plots(train_losses, epoch_times, batch_losses, 
-                          learning_rates, q_predictions, position_errors, 
+    generate_training_plots(train_losses, epoch_times, batch_losses,
+                          learning_rates, q_predictions, position_errors,
                           output_dir, len(train_losses))
-    
+
     # 3. 生成详细的收敛分析图
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle('Detailed Training Analysis', fontsize=16)
-    
+
     # Loss收敛详细分析
     axes[0, 0].plot(range(1, len(train_losses) + 1), train_losses, 'b-', linewidth=2, label='Training Loss')
     if len(train_losses) > 10:
         # 添加移动平均
         window_size = max(1, len(train_losses) // 10)
         moving_avg = np.convolve(train_losses, np.ones(window_size)/window_size, mode='valid')
-        axes[0, 0].plot(range(window_size, len(train_losses) + 1), moving_avg, 'r--', 
+        axes[0, 0].plot(range(window_size, len(train_losses) + 1), moving_avg, 'r--',
                        linewidth=2, label=f'Moving Average ({window_size})')
     axes[0, 0].set_title('Training Loss Convergence Analysis')
     axes[0, 0].set_xlabel('Epoch')
@@ -938,22 +962,22 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].set_yscale('log')
-    
+
     # 位置误差统计
     if position_errors:
         axes[0, 1].boxplot(position_errors, patch_artist=True)
         axes[0, 1].set_title('Position Error Statistics')
         axes[0, 1].set_ylabel('Position Error (meters)')
         axes[0, 1].grid(True, alpha=0.3)
-        
+
         # 添加统计信息
         stats_text = f'Mean: {np.mean(position_errors):.4f}m\n'
         stats_text += f'Std: {np.std(position_errors):.4f}m\n'
         stats_text += f'Median: {np.median(position_errors):.4f}m\n'
         stats_text += f'95%ile: {np.percentile(position_errors, 95):.4f}m'
-        axes[0, 1].text(0.02, 0.98, stats_text, transform=axes[0, 1].transAxes, 
+        axes[0, 1].text(0.02, 0.98, stats_text, transform=axes[0, 1].transAxes,
                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat'))
-    
+
     # Q矩阵热力图（最后一个epoch）
     if q_predictions:
         q_final = q_predictions[-1]
@@ -962,7 +986,7 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
         axes[1, 0].set_title('Final Q Matrix Diagonal Elements')
         axes[1, 0].set_ylabel('Element Index')
         plt.colorbar(im, ax=axes[1, 0])
-    
+
     # 训练效率分析
     if epoch_times:
         axes[1, 1].plot(range(1, len(epoch_times) + 1), epoch_times, 'g-', linewidth=2)
@@ -970,37 +994,37 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
         axes[1, 1].set_xlabel('Epoch')
         axes[1, 1].set_ylabel('Time per Epoch (seconds)')
         axes[1, 1].grid(True, alpha=0.3)
-        
+
         # 添加平均时间线
         avg_time = np.mean(epoch_times)
-        axes[1, 1].axhline(y=avg_time, color='red', linestyle='--', 
+        axes[1, 1].axhline(y=avg_time, color='red', linestyle='--',
                           label=f'Average: {avg_time:.2f}s')
         axes[1, 1].legend()
-    
+
     plt.tight_layout()
-    
+
     # 保存详细分析图
     analysis_path = os.path.join(output_dir, 'detailed_analysis.png')
     plt.savefig(analysis_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     # 4. 生成文本报告
     report_path = os.path.join(output_dir, 'training_report.txt')
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("A-KIT 训练报告\n")
         f.write("=" * 50 + "\n\n")
-        
+
         f.write("训练配置:\n")
         f.write(f"- 数据集样本数: {len(dataset)}\n")
         f.write(f"- 训练轮次: {len(train_losses)}\n")
         f.write(f"- 总训练时间: {total_training_time:.2f} 秒\n")
         f.write(f"- 平均每轮时间: {np.mean(epoch_times):.2f} 秒\n\n")
-        
+
         f.write("训练结果:\n")
         f.write(f"- 初始Loss: {train_losses[0]:.6f}\n")
         f.write(f"- 最终Loss: {train_losses[-1]:.6f}\n")
         f.write(f"- Loss下降: {(train_losses[0] - train_losses[-1])/train_losses[0]*100:.2f}%\n\n")
-        
+
         if position_errors:
             f.write("位置误差统计:\n")
             f.write(f"- 平均误差: {np.mean(position_errors):.4f} 米\n")
@@ -1008,14 +1032,14 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
             f.write(f"- 中位数误差: {np.median(position_errors):.4f} 米\n")
             f.write(f"- 95%分位数: {np.percentile(position_errors, 95):.4f} 米\n")
             f.write(f"- 99%分位数: {np.percentile(position_errors, 99):.4f} 米\n\n")
-        
+
         if q_predictions:
             f.write("Q矩阵演化:\n")
             q_initial = q_predictions[0]
             q_final = q_predictions[-1]
             for i in range(min(5, len(q_final))):
                 f.write(f"- Q[{i+1}]: {q_initial[i]:.6f} → {q_final[i]:.6f}\n")
-    
+
     print(f"\n=== 训练完成报告 ===")
     print(f"模型已保存到: {model_path}")
     print(f"详细分析图: {analysis_path}")
@@ -1026,55 +1050,54 @@ def generate_final_report(model, train_losses, epoch_times, batch_losses,
         print(f"平均位置误差: {np.mean(position_errors):.4f}米")
 
 
-def run_small_scale_experiment(data_dirs,
+def run_small_scale_experiment(train_dirs,
+                               val_dirs,
                                max_samples=200,
                                epochs=5,
                                batch_size=8,
-                               val_ratio=0.1,
                                learning_rate=1e-2,
                                seq_len=100,
                                device=None,
                                run_overfit=False,
                                overfit_steps=500,
-                               overfit_lr=1e-3):
+                               overfit_lr=1e-3,
+                               seed=42,
+                               output_root="runs",
+                               experiment_name="akit_small",
+                               runtime_config=None):
     """
-    小规模实验：合并数据后按 max_samples 随机抽取（若指定），再按 80/20 划分为训练/验证
+    小规模实验：按完整轨迹分开加载训练/验证集，并在两个集合内各自抽样。
     """
     import csv
     import shutil
-    from torch.utils.data import Subset, random_split
+    from torch.utils.data import Subset
 
+    set_reproducible_seed(seed)
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = resolve_device("auto")
 
     print("Loading dataset (small-scale)...")
-    full_dataset = MultiDatasetIMU(data_dirs, seq_len=seq_len)
-    N = len(full_dataset)
-    if N == 0:
-        print("没有可用样本，检查数据路径/对齐。")
-        return
+    full_train_dataset = MultiDatasetIMU(train_dirs, seq_len=seq_len)
+    full_val_dataset = MultiDatasetIMU(val_dirs, seq_len=seq_len)
+    if len(full_train_dataset) == 0 or len(full_val_dataset) == 0:
+        raise RuntimeError("没有可用的训练或验证样本，请检查轨迹目录和数据对齐。")
 
-    use_n = min(max_samples, N)
+    rng = np.random.default_rng(seed)
 
-    # 随机抽取 use_n 个样本（如果 use_n < N）
-    if use_n < N:
-        indices = np.random.permutation(N)[:use_n].tolist()
-        working_dataset = Subset(full_dataset, indices)
-    else:
-        working_dataset = full_dataset
+    def bounded_subset(dataset):
+        use_n = min(max_samples, len(dataset))
+        indices = rng.permutation(len(dataset))[:use_n].tolist()
+        return Subset(dataset, indices), indices
 
-    # 按 80/20 划分训练/验证
-    train_N = int(len(working_dataset) * 0.8)
-    val_N = len(working_dataset) - train_N
-    if train_N < 1 or val_N < 1:
-        raise RuntimeError('Not enough samples for train/val split')
-
-    train_dataset, val_dataset = random_split(working_dataset, [train_N, val_N])
+    train_dataset, train_indices = bounded_subset(full_train_dataset)
+    val_dataset, val_indices = bounded_subset(full_val_dataset)
+    train_N = len(train_dataset)
+    val_N = len(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    print(f"Small experiment: total_used={len(working_dataset)}, train={train_N}, val={val_N}")
+    print(f"Small experiment: train={train_N}, val={val_N} (bounded independently)")
 
     # 计算训练集全局 IMU per-channel 均值/方差（用于统一归一化）
     try:
@@ -1121,11 +1144,25 @@ def run_small_scale_experiment(data_dirs,
     imu_mean_tensor = torch.tensor(imu_mean, dtype=torch.float64).view(1, -1, 1).to(device)
     imu_std_tensor = torch.tensor(imu_std, dtype=torch.float64).view(1, -1, 1).to(device)
 
-    # 创建输出目录（不打印路径以减少输出）
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"training_results_small_{timestamp}"
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = str(create_output_dir(output_root, experiment_name))
     print(f"Small experiment outputs -> {output_dir}")
+    if runtime_config is not None:
+        save_json(os.path.join(output_dir, "config.json"), runtime_config)
+        save_json(
+            os.path.join(output_dir, "environment.json"),
+            collect_environment(runtime_config["repo_root"]),
+        )
+    save_json(
+        os.path.join(output_dir, "split_manifest.json"),
+        {
+            "strategy": "trajectory_directory_split_with_bounded_sampling",
+            "seed": seed,
+            "train_dirs": train_dirs,
+            "val_dirs": val_dirs,
+            "train_source_indices": train_indices,
+            "val_source_indices": val_indices,
+        },
+    )
 
     # 构建模型与优化器（与 main 保持一致，使用 float32）
     model = Network(
@@ -1155,15 +1192,15 @@ def run_small_scale_experiment(data_dirs,
             obatch = None
         if obatch is not None:
             o_imu = obatch["imu"].to(device).float()
-            o_P = obatch["P"].to(device).float()
-            o_Q_origin = obatch["Q"].to(device).float()
-            
+            o_P = obatch["P_start"].to(device).float()
+            o_Q_origin = obatch["Q_acc"].to(device).float()
+
             # 目标：使用 Q_origin 的对角线作为网络目标，形状 (B, D)
             try:
                 target_diag = o_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
             except Exception:
                 target_diag = torch.stack([torch.diagonal(m) for m in o_Q_origin], dim=0)
-            
+
             overfit_optimizer = optim.Adam(model.parameters(), lr=overfit_lr)
             model.train()
             for step in range(1, overfit_steps + 1):
@@ -1191,7 +1228,7 @@ def run_small_scale_experiment(data_dirs,
                         max_g = 0.0
                     print(f"[overfit] step={step}/{overfit_steps} loss={loss_of.item():.6e} grad_norm={total_norm:.6e} grad_max={max_g:.6e}")
         print("Single-batch overfit test finished.")
-    
+
     # 保存统计以便复现（确保 output_dir 已创建）
     try:
         np.save(os.path.join(output_dir, 'imu_mean.npy'), imu_mean)
@@ -1208,15 +1245,16 @@ def run_small_scale_experiment(data_dirs,
         for batch_idx, batch in enumerate(train_loader):
             imu = batch["imu"].to(device).float()
             pos_true = batch["pos_true"].to(device).float()
+            imu = (imu - imu_mean_tensor) / imu_std_tensor
 
-            phi = batch["phi"].to(device).float()
+            phi = batch["Phi_acc"].to(device).float()
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
-            P = batch["P"].to(device).float()
-            stateX = batch["stateX"].to(device).float()
-            Q_origin = batch["Q"].to(device).float()
-             
+            P = batch["P_start"].to(device).float()
+            stateX = batch["state_pred"].to(device).float()
+            Q_origin = batch["Q_acc"].to(device).float()
+
 
             # 网络预测 Q 的对角线元素
             Q_diag = model(imu, P.unsqueeze(-1))
@@ -1237,7 +1275,7 @@ def run_small_scale_experiment(data_dirs,
             pos_predict = kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
 
             loss = torch.mean((pos_predict - pos_true) ** 2)
-            
+
             # ====== 小实验：在 backward 之前做 autograd.grad 检查 ======
             try:
                 try:
@@ -1299,14 +1337,15 @@ def run_small_scale_experiment(data_dirs,
             for vbatch in val_loader:
                 v_imu = vbatch["imu"].to(device).float()
                 v_pos_true = vbatch["pos_true"].to(device).float()
+                v_imu = (v_imu - imu_mean_tensor) / imu_std_tensor
 
-                v_phi = vbatch["phi"].to(device).float()
+                v_phi = vbatch["Phi_acc"].to(device).float()
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
-                v_P = vbatch["P"].to(device).float()
-                v_stateX = vbatch["stateX"].to(device).float()
-                v_Q_origin = vbatch["Q"].to(device).float()
+                v_P = vbatch["P_start"].to(device).float()
+                v_stateX = vbatch["state_pred"].to(device).float()
+                v_Q_origin = vbatch["Q_acc"].to(device).float()
 
                 v_Q_diag = model(v_imu, v_P.unsqueeze(-1))
                 v_Q_diag = torch.nn.functional.softplus(v_Q_diag)
@@ -1324,31 +1363,139 @@ def run_small_scale_experiment(data_dirs,
 
         print(f"Epoch [{epoch+1}/{epochs}] train_loss={avg_train_loss:.6f} val_loss={avg_val_loss:.6f}")
 
+    final_path = os.path.join(output_dir, "final_model.pth")
+    torch.save(
+        checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            config=runtime_config or {},
+            epoch=len(train_losses),
+            metrics={"train_losses": train_losses, "val_losses": val_losses},
+            normalization={"imu_mean": imu_mean, "imu_std": imu_std},
+        ),
+        final_path,
+    )
     print(f"Small experiment finished. Train losses: {train_losses}, Val losses: {val_losses}")
+    print(f"Checkpoint: {final_path}")
 
 
-# 替换 __main__ 入口以支持 --small 参数
-if __name__ == "__main__":
+def parse_args():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--small", action="store_true", help="run small-scale experiment")
-    args = parser.parse_args()
-    if args.small:
-        base_path = r"F:\AAA-lulul\科研工作\毕业设计\A-KIT-main\A-KIT-main\data_lj"
-        data_dirs = [
-            os.path.join(base_path, "data013325"),
-            os.path.join(base_path, "data065517"),
-            os.path.join(base_path, "data090854"),
-            os.path.join(base_path, "data212832"),
-            os.path.join(base_path, "data122041")
-        ]
-        run_small_scale_experiment(data_dirs,
-                                   max_samples=200,
-                                   epochs=5,
-                                   batch_size=8,
-                                   val_ratio=0.1,
-                                   learning_rate=1e-4,
-                                   seq_len=100,
-                                   run_overfit=True)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(
+        description="A-KIT GNSS-interval equivalent-Q training entry point",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--small", action="store_true", help="run a bounded diagnostic experiment")
+    parser.add_argument("--data-root", default=os.path.join(repo_root, "data_lj"))
+    parser.add_argument(
+        "--train-dirs",
+        nargs="+",
+        default=["data065517", "data090854", "data122041"],
+        help="complete training trajectory directories relative to --data-root",
+    )
+    parser.add_argument(
+        "--val-dirs",
+        nargs="+",
+        default=["data212832"],
+        help="complete validation trajectory directories relative to --data-root",
+    )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--seq-len", type=int, default=100)
+    parser.add_argument(
+        "--max-samples", type=int, default=200,
+        help="maximum samples selected independently from train and validation sets; used only with --small",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--output-root", default=os.path.join(repo_root, "runs"))
+    parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--run-overfit", action="store_true")
+    parser.add_argument("--overfit-steps", type=int, default=200)
+    parser.add_argument("--overfit-lr", type=float, default=1e-3)
+    return parser.parse_args()
+
+
+def build_runtime_config(args):
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    small = bool(args.small)
+    epochs = args.epochs if args.epochs is not None else (5 if small else 50)
+    batch_size = args.batch_size if args.batch_size is not None else (8 if small else 32)
+    learning_rate = args.learning_rate if args.learning_rate is not None else (1e-4 if small else 5e-3)
+    if epochs < 1 or batch_size < 1 or args.seq_len < 1 or args.max_samples < 2:
+        raise ValueError("epochs, batch size and seq length must be positive; max samples must be >= 2")
+    train_dirs = resolve_data_dirs(args.data_root, args.train_dirs)
+    val_dirs = resolve_data_dirs(args.data_root, args.val_dirs)
+    overlap = set(map(os.path.realpath, train_dirs)) & set(map(os.path.realpath, val_dirs))
+    if overlap:
+        raise ValueError(
+            "Training and validation trajectories must be disjoint; overlap: "
+            + ", ".join(sorted(overlap))
+        )
+    return {
+        "schema_version": 1,
+        "mode": "small" if small else "gnss_interval_equivalent_q",
+        "scientific_status": "gnss_interval_equivalent_q",
+        "repo_root": repo_root,
+        "data_root": os.path.abspath(os.path.expanduser(args.data_root)),
+        "train_dir_names": list(args.train_dirs),
+        "val_dir_names": list(args.val_dirs),
+        "train_dirs": train_dirs,
+        "val_dirs": val_dirs,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "seq_len": args.seq_len,
+        "max_samples": args.max_samples,
+        "seed": args.seed,
+        "device": args.device,
+        "output_root": os.path.abspath(os.path.expanduser(args.output_root)),
+        "experiment_name": args.experiment_name or ("akit_small" if small else "akit_legacy"),
+        "run_overfit": bool(args.run_overfit),
+        "overfit_steps": args.overfit_steps,
+        "overfit_lr": args.overfit_lr,
+        "model": {
+            "name": "set_transformer",
+            "patch_size": 10,
+            "filter_size": 10,
+            "in_chans": 9,
+            "embedding_size": 64,
+            "num_heads": 4,
+            "feedforward_expansion": 128,
+            "k": 1,
+            "blocklayers": 2,
+            "output_size": 15,
+        },
+    }
+
+
+if __name__ == "__main__":
+    cli_args = parse_args()
+    runtime_config = build_runtime_config(cli_args)
+    print(
+        "A-KIT: using one GNSS-interval Phi_acc/P_start/Q_acc covariance prediction per sample."
+    )
+    if cli_args.small:
+        run_small_scale_experiment(
+            runtime_config["train_dirs"],
+            runtime_config["val_dirs"],
+            max_samples=runtime_config["max_samples"],
+            epochs=runtime_config["epochs"],
+            batch_size=runtime_config["batch_size"],
+            learning_rate=runtime_config["learning_rate"],
+            seq_len=runtime_config["seq_len"],
+            device=resolve_device(runtime_config["device"]),
+            run_overfit=runtime_config["run_overfit"],
+            overfit_steps=runtime_config["overfit_steps"],
+            overfit_lr=runtime_config["overfit_lr"],
+            seed=runtime_config["seed"],
+            output_root=runtime_config["output_root"],
+            experiment_name=runtime_config["experiment_name"],
+            runtime_config=runtime_config,
+        )
     else:
-        main()
+        main(runtime_config)

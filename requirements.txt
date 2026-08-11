@@ -1,0 +1,10 @@
+# Tested project environment (Python 3.10)
+numpy==2.2.6
+matplotlib==3.10.9
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# Install the CUDA-enabled PyTorch wheels using the official PyTorch index
+# appropriate for the target machine. The current verified environment uses
+# torch/vision/audio builds tagged +cu121.
