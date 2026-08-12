@@ -2,9 +2,84 @@
 #include "BASEDLL/BaseMath.h"
 #include "BASEDLL/BaseApp.h"
 #include "BASEDLL/BaseTime.h"
+#include <map>
+#include <mutex>
 
 namespace basetk
 {
+	namespace
+	{
+		//lj修改 2026-08-11：累计状态保存在实现文件中，避免改变导出类CGLSEstimator的内存布局
+		struct CGLSIntervalAccumulator
+		{
+			Mat PStart;
+			Mat PhiAcc;
+			Mat QAcc;
+			bool initialized;
+			bool startNewInterval;
+			bool hasSuccessfulGNSSBoundary;
+			int stepCount;
+
+			CGLSIntervalAccumulator()
+			{
+				initialized = false;
+				startNewInterval = true;
+				hasSuccessfulGNSSBoundary = false;
+				stepCount = 0;
+			}
+
+			void reset()
+			{
+				PStart.freeMatrix();
+				PhiAcc.freeMatrix();
+				QAcc.freeMatrix();
+				initialized = false;
+				startNewInterval = true;
+				hasSuccessfulGNSSBoundary = false;
+				stepCount = 0;
+			}
+		};
+
+		typedef std::map<const CGLSEstimator*, CGLSIntervalAccumulator*> CGLSAccumulatorMap;
+
+		CGLSAccumulatorMap& GLSAccumulatorMap()
+		{
+			// 进程退出阶段不销毁容器本身，避免静态对象析构顺序导致已销毁容器被再次访问。
+			static CGLSAccumulatorMap* accumulators = new CGLSAccumulatorMap();
+			return *accumulators;
+		}
+
+		std::mutex& GLSAccumulatorMutex()
+		{
+			static std::mutex* mutex = new std::mutex();
+			return *mutex;
+		}
+
+		CGLSIntervalAccumulator& GetGLSAccumulator(const CGLSEstimator* estimator)
+		{
+			std::lock_guard<std::mutex> lock(GLSAccumulatorMutex());
+			CGLSIntervalAccumulator*& accumulator = GLSAccumulatorMap()[estimator];
+			if (accumulator == NULL) accumulator = new CGLSIntervalAccumulator();
+			return *accumulator;
+		}
+
+		CGLSIntervalAccumulator* FindGLSAccumulator(const CGLSEstimator* estimator)
+		{
+			std::lock_guard<std::mutex> lock(GLSAccumulatorMutex());
+			CGLSAccumulatorMap::iterator iter = GLSAccumulatorMap().find(estimator);
+			return iter == GLSAccumulatorMap().end() ? NULL : iter->second;
+		}
+
+		void EraseGLSAccumulator(const CGLSEstimator* estimator)
+		{
+			std::lock_guard<std::mutex> lock(GLSAccumulatorMutex());
+			CGLSAccumulatorMap::iterator iter = GLSAccumulatorMap().find(estimator);
+			if (iter == GLSAccumulatorMap().end()) return;
+			iter->second->reset();
+			delete iter->second;
+			GLSAccumulatorMap().erase(iter);
+		}
+	}
 
 
 	CLSEstimator::CLSEstimator()
@@ -195,18 +270,15 @@ namespace basetk
 		m_bResiChisq = true;
 		m_nState = 0;
 		m_nMeas = 0;
-		//lj修改 2026-08-11：初始化GNSS成功更新区间的累计状态
+		//lj修改 2026-08-11：实例累计状态已移至cpp内部映射，不增加导出类尺寸
 		updateTime = 0;
-		m_AccInitialized = false;
-		m_StartNewInterval = true;
-		m_HasSuccessfulGNSSBoundary = false;
-		m_AccStepCount = 0;
 	}
 
 
 	CGLSEstimator::~CGLSEstimator()
 	{
 		FreeGLS(true);
+		EraseGLSAccumulator(this);
 	}
 
 
@@ -278,14 +350,9 @@ namespace basetk
 		m_Ry.freeMatrix();
 		m_KFTmp_F.freeMatrix();
 		m_KFTmp_Q.freeMatrix();
-		//lj修改 2026-08-11：释放GNSS区间累计矩阵成员
-		m_PStart.freeMatrix();
-		m_PhiAcc.freeMatrix();
-		m_QAcc.freeMatrix();
-		m_AccInitialized = false;
-		m_StartNewInterval = true;
-		m_HasSuccessfulGNSSBoundary = false;
-		m_AccStepCount = 0;
+		//lj修改 2026-08-11：重置cpp内部保存的GNSS区间累计状态
+		CGLSIntervalAccumulator* accumulator = FindGLSAccumulator(this);
+		if (accumulator != NULL) accumulator->reset();
 	}
 
 
@@ -333,42 +400,39 @@ namespace basetk
 			m_KFTmp_Q.add2(Qc);
 			m_KFTmp_Q *= (dt*0.5);
 
-			//lj修改 2026-08-11：使用实例成员累计相邻两次成功GNSS位置更新之间的传播量
-			if (!m_AccInitialized || m_PStart.row != StateP.row || m_PStart.col != StateP.col)
+			//lj修改 2026-08-11：按估计器实例累计，同时保持CGLSEstimator原有内存布局
+			CGLSIntervalAccumulator& accumulator = GetGLSAccumulator(this);
+			if (!accumulator.initialized || accumulator.PStart.row != StateP.row || accumulator.PStart.col != StateP.col)
 			{
-				m_PStart.freeMatrix();
-				m_PhiAcc.freeMatrix();
-				m_QAcc.freeMatrix();
-				m_PStart.mat(StateP.row, StateP.col);
-				m_PhiAcc.mat(Phi.row, Phi.col);
-				m_QAcc.mat(m_KFTmp_Q.row, m_KFTmp_Q.col);
-				m_AccInitialized = true;
-				m_StartNewInterval = true;
-				m_HasSuccessfulGNSSBoundary = false;
+				accumulator.reset();
+				accumulator.PStart.mat(StateP.row, StateP.col);
+				accumulator.PhiAcc.mat(Phi.row, Phi.col);
+				accumulator.QAcc.mat(m_KFTmp_Q.row, m_KFTmp_Q.col);
+				accumulator.initialized = true;
 			}
 
 			//lj修改 2026-08-11：成功GNSS更新后的第一次传播以更新后的后验协方差为区间起点
-			if (m_StartNewInterval)
+			if (accumulator.startNewInterval)
 			{
-				m_PStart = StateP;
-				m_PhiAcc.zero();
-				for (int i = 0; i < m_PhiAcc.row && i < m_PhiAcc.col; i++) m_PhiAcc.at(i, i, 1.0);
-				m_QAcc.zero();
-				m_AccStepCount = 0;
-				m_StartNewInterval = false;
+				accumulator.PStart = StateP;
+				accumulator.PhiAcc.zero();
+				for (int i = 0; i < accumulator.PhiAcc.row && i < accumulator.PhiAcc.col; i++) accumulator.PhiAcc.at(i, i, 1.0);
+				accumulator.QAcc.zero();
+				accumulator.stepCount = 0;
+				accumulator.startNewInterval = false;
 			}
 
 			// Q_acc,new = Phi_current * Q_acc,old * Phi_current^T + Q_current
-			Mat QAccNew(m_QAcc.row, m_QAcc.col);
-			MatrixMultiply_HPHT(Phi.row, Phi.col, Phi.x, m_QAcc.x, false, QAccNew.x);
+			Mat QAccNew(accumulator.QAcc.row, accumulator.QAcc.col);
+			MatrixMultiply_HPHT(Phi.row, Phi.col, Phi.x, accumulator.QAcc.x, false, QAccNew.x);
 			QAccNew.add2(m_KFTmp_Q);
-			m_QAcc = QAccNew;
+			accumulator.QAcc = QAccNew;
 
 			// Phi_acc,new = Phi_current * Phi_acc,old (order must not be reversed)
-			Mat PhiAccNew(m_PhiAcc.row, m_PhiAcc.col);
-			PhiAccNew.multiply(Phi, m_PhiAcc);
-			m_PhiAcc = PhiAccNew;
-			m_AccStepCount++;
+			Mat PhiAccNew(accumulator.PhiAcc.row, accumulator.PhiAcc.col);
+			PhiAccNew.multiply(Phi, accumulator.PhiAcc);
+			accumulator.PhiAcc = PhiAccNew;
+			accumulator.stepCount++;
 
 			// Pp = Phi*P*Phi_T + Q
 			MatrixMultiply_HPHT(Phi.row, Phi.col, Phi.x, StateP.x, false, StatePPre.x);
@@ -381,10 +445,11 @@ namespace basetk
 	//lj修改 2026-08-11：仅在GNSS位置更新成功后输出并结束当前累计区间
 	void CGLSEstimator::FinishGNSSInterval(Mat PPred)
 	{
-		if (!m_AccInitialized || updateTime == 0) return;
+		CGLSIntervalAccumulator* accumulator = FindGLSAccumulator(this);
+		if (accumulator == NULL || !accumulator->initialized || updateTime == 0) return;
 
 		// 第一次成功GNSS更新仅建立起始边界，不输出启动阶段的不完整区间。
-		if (m_HasSuccessfulGNSSBoundary)
+		if (accumulator->hasSuccessfulGNSSBoundary)
 		{
 			static FILE* fpPStart = fopen("PStart.txt", "w");
 			static FILE* fpPhiAcc = fopen("PhiAcc.txt", "w");
@@ -403,15 +468,15 @@ namespace basetk
 				headerWritten = 1;
 			}
 
-			if (fpPStart) { fprintf(fpPStart, "%d", updateTime); m_PStart.write(fpPStart); fprintf(fpPStart, "\n"); }
-			if (fpPhiAcc) { fprintf(fpPhiAcc, "%d", updateTime); m_PhiAcc.write(fpPhiAcc); fprintf(fpPhiAcc, "\n"); }
-			if (fpQAcc) { fprintf(fpQAcc, "%d", updateTime); m_QAcc.write(fpQAcc); fprintf(fpQAcc, "\n"); }
+			if (fpPStart) { fprintf(fpPStart, "%d", updateTime); accumulator->PStart.write(fpPStart); fprintf(fpPStart, "\n"); }
+			if (fpPhiAcc) { fprintf(fpPhiAcc, "%d", updateTime); accumulator->PhiAcc.write(fpPhiAcc); fprintf(fpPhiAcc, "\n"); }
+			if (fpQAcc) { fprintf(fpQAcc, "%d", updateTime); accumulator->QAcc.write(fpQAcc); fprintf(fpQAcc, "\n"); }
 			if (fpPPredCpp) { fprintf(fpPPredCpp, "%d", updateTime); PPred.write(fpPPredCpp); fprintf(fpPPredCpp, "\n"); }
-			if (fpAccMeta) fprintf(fpAccMeta, "%d %d\n", updateTime, m_AccStepCount);
+			if (fpAccMeta) fprintf(fpAccMeta, "%d %d\n", updateTime, accumulator->stepCount);
 		}
 
-		m_HasSuccessfulGNSSBoundary = true;
-		m_StartNewInterval = true;
+		accumulator->hasSuccessfulGNSSBoundary = true;
+		accumulator->startNewInterval = true;
 		updateTime = 0;
 	}
 

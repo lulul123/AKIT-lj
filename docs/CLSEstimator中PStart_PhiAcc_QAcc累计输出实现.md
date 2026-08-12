@@ -191,7 +191,7 @@ error_rel = np.linalg.norm(P_pred_rebuilt - P_pred_cpp) / (
 
 同时检查 `AccMeta.txt`。100 Hz IMU、稳定 1 Hz 区间通常应接近 100 步；插值、起始区间或数据缺失可能使步数不同。
 
-## 10. 当前边界和后续需要确认的事项
+## 10. 当前边界和注意事项
 
 ### 10.1 当前按成功 GNSS 位置更新划分区间
 
@@ -211,26 +211,21 @@ bPassUPT && (ELCType & ELCTYPE_POS)
 
 累计矩阵和控制标志已经是类成员，各实例独立维护区间状态。输出文件句柄仍为函数静态变量，因此多个实例若同时写同一组文件，仍需进一步拆分输出路径或文件句柄。
 
-### 10.4 NominalState_prior
-
-`PStart/PhiAcc/QAcc` 在 `CLSEstimator.cpp` 中产生；网络状态输入 `NominalState_prior.txt` 应在 `CLooseCoupling.cpp` 的 GNSS 更新前输出。它是绝对名义状态，不应使用更新后的 `StateX_new.txt` 代替。
-
 ## 11. 与 Python 训练代码的对应关系
 
-Python 数据字段为：
+当前训练任务只学习区间累计过程噪声 `QAcc` 的缩放，不使用名义状态作为网络输入。Python 中与累计协方差相关的数据字段为：
 
 ```text
-PStart.txt             -> sample["P_start"]
-PhiAcc.txt             -> sample["Phi_acc"]
-QAcc.txt               -> sample["Q_acc"]
-NominalState_prior.txt -> sample["state_pred"]
+PStart.txt -> sample["P_start"]
+PhiAcc.txt -> sample["Phi_acc"]
+QAcc.txt   -> sample["Q_acc"]
 ```
 
-网络预测累计 Q 的缩放系数后只进行一次区间级协方差预测：
+网络输出 `QAcc` 的缩放系数，得到 `Q_acc_pred`，然后只进行一次区间级协方差预测：
 
 ```python
 P_base = Phi_acc @ P_start @ Phi_acc.transpose(-2, -1)
 P_pred = P_base + Q_acc_pred
 ```
 
-不能再次进行高频 Q 递推，也不能再对 `state_pred` 乘一次 `Phi_acc`。
+不能再次进行高频 Q 递推。`PPredCpp.txt` 用于校验上式的累计结果，`AccMeta.txt` 用于校验时间戳和传播步数，两者都不是网络的必要输入。
