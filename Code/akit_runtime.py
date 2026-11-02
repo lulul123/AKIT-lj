@@ -1,4 +1,8 @@
-"""Runtime helpers for reproducible A-KIT experiments."""
+"""A-KIT 实验运行与可复现性公共函数。
+
+负责随机种子、CPU/CUDA 选择、轨迹目录解析、带时间戳的输出目录、运行环境记录、
+JSON 保存及标准 checkpoint 内容。它不负责模型定义、数据解析或训练循环。
+"""
 
 from __future__ import annotations
 

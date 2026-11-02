@@ -163,6 +163,7 @@ namespace sinstk
 		setSINSKF_InitialState(m_pSINSOpt, &m_GLSInfo);
 		setSINSKF_Qc_Const(m_pSINSOpt, &m_GLSInfo);
 		setSINSKF_CF_Const(m_bReverse, m_pSINSOpt, &m_GLSInfo);
+
 		return true;
 	}
 
@@ -219,6 +220,21 @@ namespace sinstk
 		setSINSKF_EarthPara(m_pSINSOpt, &m_GLSInfo, &m_SimpleEGM, m_GLSInfo.Position, m_GLSInfo.Velocity, true, true);
 		setSINSKF_Qc_Change(m_pSINSOpt, &m_GLSInfo, m_pIMUFFStream->m_bIn);
 		setSINSKF_CF_Change(m_bReverse, m_pSINSOpt, &m_GLSInfo);
+
+		// 输出本组数据实际用于预报的Qc，整组只输出一次。
+		static bool qcWritten = false;
+		if (!qcWritten)
+		{
+			FILE* fpQc = fopen("Qc.txt", "w");
+			if (fpQc)
+			{
+				fprintf(fpQc, "Qc\n");
+				m_GLSInfo.SINSQc.write(fpQc);
+				fprintf(fpQc, "\n");
+				fclose(fpQc);
+				qcWritten = true;
+			}
+		}
 		//lj毕设：KFPrediction可以用来输出状态转移矩阵
 	    //lj毕设：m_GLSInfo.StateX;m_GLSInfo.StateP, m_GLSInfo.SINSPhi（前一时刻的P矩阵、状态转移矩阵）
 		// 本来在这里输出状态
@@ -244,8 +260,19 @@ namespace sinstk
 		//	m_GLSInfo.SINSPhi.write(fp4);
 		//	fprintf(fp4, "\n");
 		//}
-		//lj修改 2026-08-11：不再按整数秒结束累计区间，改由成功GNSS位置更新触发
 		m_GLS.KFPrediction(m_SINSMech.m_DeltTime, m_GLSInfo.SINSCF, m_GLSInfo.SINSQc, m_GLSInfo.StateP, m_GLSInfo.SINSPhi, m_GLSInfo.SINSPPre);
+
+		// KFPrediction返回时SINSPhi就是刚算出的单步Phi。在外层输出以保持DLL接口不变。
+		static FILE* fpPhi = fopen("Phi.txt", "w");
+		if (fpPhi && m_SINSMech.m_DeltTime > 0.0)
+		{
+			static bool headerWritten = false;
+			if (!headerWritten) { fprintf(fpPhi, "WeekSecond DeltTime Phi\n"); headerWritten = true; }
+			fprintf(fpPhi, "%.9f %.15e", _TOW(m_UpdateTime), m_SINSMech.m_DeltTime);
+			m_GLSInfo.SINSPhi.write(fpPhi);
+			fprintf(fpPhi, "\n");
+			fflush(fpPhi);
+		}
 		m_GLSInfo.StateP = m_GLSInfo.SINSPPre;
 
 		// 3. 累乘RTS矩阵
@@ -788,11 +815,39 @@ namespace sinstk
 			setMEQ(0, ELCType); // 得到位置的验后残差
 		}
 
-		//lj修改 2026-08-11：只有通过质控的GNSS位置更新才结束并输出累计区间
+		// GNSS位置更新使用的是更新前最后一次机械编排结果。
 		if (bPassUPT && (ELCType&ELCTYPE_POS))
 		{
-			m_GLS.updateTime = m_UpdateTime.secsOfWeek;
-			m_GLS.FinishGNSSInterval(m_GLSInfo.SINSPPre);
+			double mechAttitude[3] = { 0.0 };
+			if (m_pSINSOpt->m_NaviSys == NAVI_E)
+			{
+				double mechLLH[3] = { 0.0 };
+				XYZ2LLH(m_SINSMech.m_Position, mechLLH);
+				Rbe2Attitude(m_SINSMech.m_Rbn, mechLLH, mechAttitude);
+			}
+			else if (m_pSINSOpt->m_NaviSys == NAVI_L)
+			{
+				Rbl2Attitude(m_SINSMech.m_Rbn, mechAttitude);
+			}
+
+			static FILE* fpGNSSMech = fopen("GNSSMech.txt", "w");
+			if (fpGNSSMech)
+			{
+				static bool headerWritten = false;
+				if (!headerWritten)
+				{
+					fprintf(fpGNSSMech, "WeekSecond Position(3) Velocity(3) AttitudeRad(3) AccelBias(3) GyrosBias(3)\n");
+					headerWritten = true;
+				}
+				fprintf(fpGNSSMech, "%.9f", _TOW(m_UpdateTime));
+				for (int j = 0; j < 3; j++) fprintf(fpGNSSMech, " %.15e", m_SINSMech.m_Position[j]);
+				for (int j = 0; j < 3; j++) fprintf(fpGNSSMech, " %.15e", m_SINSMech.m_Velocity[j]);
+				for (int j = 0; j < 3; j++) fprintf(fpGNSSMech, " %.15e", mechAttitude[j]);
+				for (int j = 0; j < 3; j++) fprintf(fpGNSSMech, " %.15e", m_GLSInfo.AccelBias[j]);
+				for (int j = 0; j < 3; j++) fprintf(fpGNSSMech, " %.15e", m_GLSInfo.GyrosBias[j]);
+				fprintf(fpGNSSMech, "\n");
+				fflush(fpGNSSMech);
+			}
 		}
 
 		m_pSINSSol->m_IMUFlag = ELCType;

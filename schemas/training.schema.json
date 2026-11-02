@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://akit.local/schemas/training.schema.json",
+  "title": "A-KIT training configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment", "data", "model", "training", "checkpoint"],
+  "properties": {
+    "schema_version": {"const": "akit-training-config-1"},
+    "experiment": {
+      "type": "object",
+      "required": ["name", "seed", "device", "output_root"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "seed": {"type": "integer", "minimum": 0},
+        "device": {"enum": ["auto", "cpu", "cuda"]},
+        "output_root": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "data": {
+      "type": "object",
+      "required": ["catalog", "train_splits", "validation_splits", "sequence_length", "normalization"],
+      "properties": {
+        "catalog": {"type": "string", "minLength": 1},
+        "train_splits": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "validation_splits": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "sequence_length": {"type": "integer", "minimum": 1},
+        "normalization": {"const": "train_global_per_channel"}
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["name", "interface_version", "input_channels", "state_dim", "output_semantics", "parameters"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "interface_version": {"const": "akit-model-1"},
+        "input_channels": {"type": "integer", "minimum": 1},
+        "state_dim": {"type": "integer", "minimum": 1},
+        "output_semantics": {"const": "raw_qc_scale_logits"},
+        "parameters": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "training": {
+      "type": "object",
+      "required": ["epochs", "batch_size", "optimizer", "loss", "gradient_clip_norm", "shuffle", "drop_last"],
+      "properties": {
+        "epochs": {"type": "integer", "minimum": 1},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "optimizer": {
+          "type": "object",
+          "required": ["name", "learning_rate", "weight_decay"],
+          "properties": {
+            "name": {"const": "adam"},
+            "learning_rate": {"type": "number", "exclusiveMinimum": 0},
+            "weight_decay": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "loss": {"const": "position_mse_through_kalman"},
+        "gradient_clip_norm": {"type": "number", "exclusiveMinimum": 0},
+        "shuffle": {"type": "boolean"},
+        "drop_last": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "checkpoint": {"type": "object"}
+  }
+}

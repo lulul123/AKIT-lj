@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://akit.local/schemas/datasets.schema.json",
+  "title": "A-KIT dataset catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "project", "defaults", "split_policy", "datasets"],
+  "properties": {
+    "schema_version": {"const": "akit-dataset-catalog-0.1-draft"},
+    "status": {"type": "string", "minLength": 1},
+    "project": {
+      "type": "object",
+      "required": ["name", "task_type", "pipeline"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "task_type": {"type": "string", "minLength": 1},
+        "pipeline": {"type": "string", "minLength": 1},
+        "metadata_updated_at": {"type": "string"},
+        "open_questions": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "metadata_resolution": {"type": "object"},
+    "defaults": {
+      "type": "object",
+      "required": ["time", "files", "required_file_keys", "sample_contract"],
+      "properties": {
+        "source": {"type": "object"},
+        "time": {
+          "type": "object",
+          "required": ["system", "expected_imu_rate_hz", "sample_window_duration_s"],
+          "properties": {
+            "system": {"type": "string"},
+            "expected_imu_rate_hz": {"type": "integer", "minimum": 1},
+            "sample_window_duration_s": {"type": "number", "exclusiveMinimum": 0}
+          },
+          "additionalProperties": true
+        },
+        "files": {
+          "type": "object",
+          "required": ["imu", "velocity", "phi", "qc", "p_start", "measurement_matrix", "measurement_covariance", "innovation", "nominal_state_prior"],
+          "additionalProperties": {"type": "string", "minLength": 1}
+        },
+        "required_file_keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "optional_file_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "reference_label": {"type": "object"},
+        "sample_contract": {"type": "object"},
+        "unverified_semantics": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "split_policy": {
+      "type": "object",
+      "required": ["unit", "normalization_statistics_source"],
+      "additionalProperties": true
+    },
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["dataset_id", "trajectory_id", "path", "gps_week", "position_reference", "split", "validation_status"],
+        "properties": {
+          "dataset_id": {"type": "string", "pattern": "^data[0-9]{6}$"},
+          "trajectory_id": {"type": "string", "pattern": "^[0-9]{6}$"},
+          "path": {"type": "string", "minLength": 1},
+          "gps_week": {"type": "integer", "minimum": 0},
+          "position_reference": {"type": "string", "minLength": 1},
+          "split": {"enum": ["train", "validation", "test"]},
+          "validation_status": {"type": "string", "minLength": 1},
+          "overrides": {"type": "object"}
+        }
+      }
+    }
+  }
+}

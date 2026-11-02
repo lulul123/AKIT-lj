@@ -1,0 +1,15 @@
+Folder	EpochCount
+data013325	7247	37197.375
+data065517	4038	55143.961
+data090854	2044	11786.935
+data122041	3346	20860.192
+data212832	11760	268697.785
+
+Target data013325: 7247
+Selected others: ['data065517', 'data090854', 'data122041', 'data212832']
+Sum others: 21188
+Total all: 28435
+
+Target distance (m): 37197.375
+Selected others distance sum (m): 356488.871
+Total distance all (m): 393686.247

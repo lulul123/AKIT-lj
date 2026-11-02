@@ -76,8 +76,6 @@ namespace basetk
 
 		// lj:修改了该函数的参数 加入更新时间
 		void KFPrediction(double dt, const Mat CF, const Mat Qc, const Mat StateP, Mat Phi, Mat StatePPre);
-		//lj修改 2026-08-11：成功的GNSS位置更新结束当前累计区间
-		void FinishGNSSInterval(Mat PPred);
 
 		// lj: 加入一个时间
 		int updateTime;
@@ -129,7 +127,6 @@ namespace basetk
 		Mat m_K;				///< Kalman滤波增益矩阵, nS x nM
 		Mat m_KFTmp_F;
 		Mat m_KFTmp_Q;
-		//lj修改 2026-08-11：GNSS区间累计状态改由cpp内部实例映射保存，不改变导出类布局
 		bool m_bPDiagonal;		///< 观测权阵P是否为对角线
 
 		void FreeGLS(bool bFreeState = true);

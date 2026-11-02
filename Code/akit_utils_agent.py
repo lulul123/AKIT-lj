@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
-# akit_utils.py
-# 公共工具：数据读取、时间对齐、数据集与 Kalman 计算
+"""A-KIT 数据读取、时间对齐、Dataset 与可微 Kalman 公共实现。
+
+该模块把一条轨迹的 IMU、速度、Phi、PStart、H、R、Inno、Qc、名义状态和参考位置
+对齐成训练样本，并实现模型输出之后的逐步协方差传播与位置更新。训练入口和 smoke
+test 共用这里的科学计算逻辑。它不定义神经网络，也不管理实验配置和 checkpoint。
+"""
 
 import os
+import math
 from collections import defaultdict
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def sample_window_key(timestamp):
+    """Return k for the left-closed, right-open sample window [k-1, k)."""
+    return math.floor(timestamp) + 1
+
+
+def phi_window_key(timestamp, tolerance=1e-7):
+    """Return k for a Phi propagation endpoint in the right-closed window (k-1, k]."""
+    return math.ceil(float(timestamp) - tolerance)
 
 
 def load_truePos(file_path):
@@ -118,8 +133,61 @@ def load_matrix_file(file_path, rows, cols):
     return data_dict
 
 
+def load_timed_matrix_sequence(file_path, rows, cols):
+    """Load all timestamped matrices without collapsing sub-second samples."""
+    records = []
+    with open(file_path, "r") as f:
+        f.readline()
+        lines = f.readlines()
+    i = 0
+    while i < len(lines):
+        values = lines[i].strip().split()
+        if len(values) < 2:
+            i += 1
+            continue
+        try:
+            timestamp = float(values[0])
+            dt = float(values[1])
+        except ValueError:
+            i += 1
+            continue
+        matrix_values = [float(v) for v in values[2:]]
+        while len(matrix_values) < rows * cols and i + 1 < len(lines):
+            i += 1
+            matrix_values.extend(float(v) for v in lines[i].strip().split())
+        if len(matrix_values) >= rows * cols:
+            records.append((timestamp, dt, np.asarray(matrix_values[:rows * cols], dtype=np.float64).reshape(rows, cols)))
+        i += 1
+    records.sort(key=lambda item: item[0])
+    return records
+
+
+def load_constant_matrix(file_path, rows, cols):
+    """Load a matrix file containing one header and one matrix without a timestamp."""
+    with open(file_path, "r") as f:
+        f.readline()
+        values = [float(v) for line in f for v in line.strip().split()]
+    if len(values) < rows * cols:
+        raise ValueError(f"{file_path} contains {len(values)} values; expected {rows * cols}")
+    return np.asarray(values[:rows * cols], dtype=np.float64).reshape(rows, cols)
+
+
+def load_gnss_mech(file_path):
+    """Load GNSS-update prior nominal states: pos, vel, attitude, accel bias, gyro bias."""
+    result = {}
+    with open(file_path, "r") as f:
+        f.readline()
+        for line in f:
+            values = line.strip().split()
+            if len(values) < 16:
+                continue
+            timestamp = float(values[0])
+            result[int(timestamp)] = np.asarray([float(v) for v in values[1:16]], dtype=np.float64).reshape(15, 1)
+    return result
+
+
 def check_time_alignment(data_dir):
-    required_files = ["imu.txt", "Vel.txt", "Inno.txt", "PhiAcc.txt", "H.txt", "R.txt", "PStart.txt", "NominalState_prior.txt", "QAcc.txt"]
+    required_files = ["imu.txt", "Vel.txt", "Inno.txt", "Phi.txt", "H.txt", "R.txt", "PStart.txt", "GNSSMech.txt", "Qc.txt"]
     for file in required_files:
         file_path = os.path.join(data_dir, file)
         if not os.path.exists(file_path):
@@ -151,6 +219,7 @@ class MultiDatasetIMU(Dataset):
             samples = self._load_single_dataset(data_dir)
             self.all_samples.extend(samples)
             print(f"Added {len(samples)} samples from {data_dir}")
+        self.max_phi_steps = max((len(sample["Phi_dt"]) for sample in self.all_samples), default=0)
         print(f"Total samples across all datasets: {len(self.all_samples)}")
 
     def _load_single_dataset(self, data_dir):
@@ -161,27 +230,30 @@ class MultiDatasetIMU(Dataset):
             raise FileNotFoundError(f"No position reference file found in {data_dir}")
         pos_file = os.path.join(data_dir, pos_files[0])
         matrix_files = {
-            "phi_acc": os.path.join(data_dir, "PhiAcc.txt"),
+            "phi": os.path.join(data_dir, "Phi.txt"),
             "H": os.path.join(data_dir, "H.txt"),
             "R": os.path.join(data_dir, "R.txt"),
             "P_start": os.path.join(data_dir, "PStart.txt"),
-            "state": os.path.join(data_dir, "NominalState_prior.txt"),
+            "state": os.path.join(data_dir, "GNSSMech.txt"),
             "inno": os.path.join(data_dir, "Inno.txt"),
-            "Q_acc": os.path.join(data_dir, "QAcc.txt")
+            "qc": os.path.join(data_dir, "Qc.txt")
         }
         imu_second_data, imu_timestamps = self._load_and_group_imu_data(imu_file, 6)
         vel_second_data = self._load_vel_data_by_imu_timestamps(vel_file, imu_timestamps, 3)
         common_seconds = set(imu_second_data.keys()) & set(vel_second_data.keys())
         print(f"Found {len(common_seconds)} seconds with complete 100Hz data")
         pos_dict = load_truePos(pos_file)
-        phi_dict = load_matrix_file(matrix_files["phi_acc"], 15, 15) if os.path.exists(matrix_files["phi_acc"]) else {}
+        phi_records = load_timed_matrix_sequence(matrix_files["phi"], 15, 15) if os.path.exists(matrix_files["phi"]) else []
+        phi_by_second = defaultdict(list)
+        for phi_time, phi_dt, phi_matrix in phi_records:
+            phi_by_second[phi_window_key(phi_time)].append((phi_time, phi_dt, phi_matrix))
         H_dict = load_matrix_file(matrix_files["H"], 3, 15) if os.path.exists(matrix_files["H"]) else {}
         R_dict = load_matrix_file(matrix_files["R"], 3, 3) if os.path.exists(matrix_files["R"]) else {}
         P_dict = load_matrix_file(matrix_files["P_start"], 15, 15) if os.path.exists(matrix_files["P_start"]) else {}
-        state_dict = load_matrix_file(matrix_files["state"], 15, 1) if os.path.exists(matrix_files["state"]) else {}
+        state_dict = load_gnss_mech(matrix_files["state"]) if os.path.exists(matrix_files["state"]) else {}
         inno_dict = load_matrix_file(matrix_files["inno"], 3, 1) if os.path.exists(matrix_files["inno"]) else {}
-        Q_dict = load_matrix_file(matrix_files["Q_acc"], 15, 15) if os.path.exists(matrix_files["Q_acc"]) else {}
-        print(f"Matrix data loaded: pos({len(pos_dict)}), Phi_acc({len(phi_dict)}), H({len(H_dict)}), R({len(R_dict)}), P_start({len(P_dict)}), state_pred({len(state_dict)}), inno({len(inno_dict)}), Q_acc({len(Q_dict)})")
+        Qc = load_constant_matrix(matrix_files["qc"], 15, 15) if os.path.exists(matrix_files["qc"]) else None
+        print(f"Matrix data loaded: pos({len(pos_dict)}), Phi_steps({len(phi_records)}), H({len(H_dict)}), R({len(R_dict)}), P_start({len(P_dict)}), state_pred({len(state_dict)}), inno({len(inno_dict)}), Qc({'yes' if Qc is not None else 'no'})")
 
         # --- 新增: 基线对齐（开始） ---
         # 目标：使用 pos_true 与 stateX 的首个对齐时刻作为 baseline，优先精确时间匹配，
@@ -221,13 +293,39 @@ class MultiDatasetIMU(Dataset):
             baseline_time = None
         # --- 新增: 基线对齐（结束） ---
 
-        matrix_times = set(pos_dict.keys()) & set(phi_dict.keys()) & set(H_dict.keys()) & \
+        matrix_times = set(pos_dict.keys()) & set(phi_by_second.keys()) & set(H_dict.keys()) & \
                        set(R_dict.keys()) & set(P_dict.keys()) & set(state_dict.keys()) & \
-                       set(inno_dict.keys()) & set(Q_dict.keys())
+                       set(inno_dict.keys())
         valid_seconds = common_seconds & matrix_times
         print(f"Found {len(valid_seconds)} seconds with aligned data")
         samples = []
+        successful_gnss_times = sorted(state_dict)
+        previous_success = {
+            current: previous for previous, current in zip(successful_gnss_times, successful_gnss_times[1:])
+        }
+        skipped_nonunit_intervals = 0
+        skipped_invalid_phi_intervals = 0
         for second in sorted(valid_seconds):
+            # PStart(second) begins at the previous successful GNSS boundary. The
+            # current network input covers exactly one second, so reject outage
+            # intervals instead of replaying only their final second of Phi.
+            if previous_success.get(second) != second - 1:
+                skipped_nonunit_intervals += 1
+                continue
+            phi_steps = sorted(phi_by_second[second], key=lambda item: item[0])
+            if not phi_steps:
+                continue
+            phi_tolerance = 5e-6
+            starts_at_boundary = abs((phi_steps[0][0] - phi_steps[0][1]) - (second - 1)) <= phi_tolerance
+            ends_at_boundary = abs(phi_steps[-1][0] - second) <= phi_tolerance
+            positive_dt = all(item[1] > 0.0 for item in phi_steps)
+            continuous = all(
+                abs((current[0] - current[1]) - previous[0]) <= phi_tolerance
+                for previous, current in zip(phi_steps, phi_steps[1:])
+            )
+            if not (starts_at_boundary and ends_at_boundary and positive_dt and continuous):
+                skipped_invalid_phi_intervals += 1
+                continue
             imu_data_100 = imu_second_data[second]
             vel_data_100 = vel_second_data[second]
             combined_data = []
@@ -251,15 +349,20 @@ class MultiDatasetIMU(Dataset):
                 "time": float(second),
                 "matrix_time": second,
                 "pos_true": pos_rel,
-                "Phi_acc": phi_dict[second],
+                "Phi_seq": np.stack([item[2] for item in phi_steps], axis=0),
+                "Phi_dt": np.asarray([item[1] for item in phi_steps], dtype=np.float64),
                 "H": H_dict[second],
                 "R": R_dict[second],
                 "P_start": P_dict[second],
                 "state_pred": stateX_mat,
                 "Inno": inno_dict[second],
-                "Q_acc": Q_dict[second],
+                "Qc": Qc,
             }
             samples.append(sample)
+        if skipped_nonunit_intervals:
+            print(f"Skipped {skipped_nonunit_intervals} samples whose successful GNSS interval was not one second")
+        if skipped_invalid_phi_intervals:
+            print(f"Skipped {skipped_invalid_phi_intervals} samples whose Phi sequence did not continuously cover (k-1, k]")
         return samples
 
     def _load_and_group_imu_data(self, imu_file, data_dim):
@@ -272,7 +375,7 @@ class MultiDatasetIMU(Dataset):
                 if len(values) < data_dim + 1:
                     continue
                 full_time = float(values[0])
-                second = int(full_time)
+                second = sample_window_key(full_time)
                 data_values = [float(v) for v in values[1:data_dim+1]]
                 if second not in second_groups:
                     second_groups[second] = []
@@ -302,7 +405,7 @@ class MultiDatasetIMU(Dataset):
                 full_time = float(values[0])
                 data_values = [float(v) for v in values[1:data_dim+1]]
                 vel_data_all[full_time] = data_values
-                second = int(full_time)
+                second = sample_window_key(full_time)
                 if vel_start_second is None:
                     vel_start_second = second
                     vel_end_second = second
@@ -312,7 +415,7 @@ class MultiDatasetIMU(Dataset):
         print(f"Total Vel data points loaded: {len(vel_data_all)}")
         vel_data_by_second = {}
         for vel_time, vel_data in vel_data_all.items():
-            second = int(vel_time)
+            second = sample_window_key(vel_time)
             if second not in vel_data_by_second:
                 vel_data_by_second[second] = {}
             vel_data_by_second[second][vel_time] = vel_data
@@ -352,18 +455,28 @@ class MultiDatasetIMU(Dataset):
         sample = self.all_samples[idx]
         imu_tensor = torch.tensor(sample["imu"], dtype=torch.float64)
         imu_tensor = imu_tensor.permute(1, 0)
+        phi_steps = len(sample["Phi_dt"])
+        phi_seq = torch.eye(15, dtype=torch.float64).repeat(self.max_phi_steps, 1, 1)
+        phi_dt = torch.zeros(self.max_phi_steps, dtype=torch.float64)
+        phi_mask = torch.zeros(self.max_phi_steps, dtype=torch.bool)
+        if phi_steps:
+            phi_seq[:phi_steps] = torch.tensor(sample["Phi_seq"], dtype=torch.float64)
+            phi_dt[:phi_steps] = torch.tensor(sample["Phi_dt"], dtype=torch.float64)
+            phi_mask[:phi_steps] = True
         return {
             "imu": imu_tensor,
             "time": torch.tensor(sample["time"], dtype=torch.float64),
             "matrix_time": torch.tensor(sample["matrix_time"], dtype=torch.float64),
             "pos_true": torch.tensor(sample["pos_true"], dtype=torch.float64),
-            "Phi_acc": torch.tensor(sample["Phi_acc"], dtype=torch.float64),
+            "Phi_seq": phi_seq,
+            "Phi_dt": phi_dt,
+            "Phi_mask": phi_mask,
             "H": torch.tensor(sample["H"], dtype=torch.float64),
             "R": torch.tensor(sample["R"], dtype=torch.float64),
             "P_start": torch.tensor(sample["P_start"], dtype=torch.float64),
             "state_pred": torch.tensor(sample["state_pred"], dtype=torch.float64),
             "Inno": torch.tensor(sample["Inno"], dtype=torch.float64),
-            "Q_acc": torch.tensor(sample["Q_acc"], dtype=torch.float64),
+            "Qc": torch.tensor(sample["Qc"], dtype=torch.float64),
         }
 
 
@@ -376,29 +489,32 @@ class IMUDataset(Dataset):
         return self.multi_dataset[idx]
 
 
-def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin):
-    """Differentiable GNSS-interval equivalent covariance prediction and update.
+def kalman_filter(Phi_seq, Phi_dt, H, R, P_start, Inno, state_pred, q_scale, Qc_origin, Phi_mask=None):
+    """Differentiable stepwise covariance prediction and GNSS position update.
     Inputs (batch first):
-      Phi_acc: (B, n, n) -- transition accumulated over the GNSS interval
+      Phi_seq: (B, T, n, n) -- per-step transitions, padded with identity
+      Phi_dt: (B, T) -- per-step propagation durations, padded with zero
+      Phi_mask: optional (B, T) boolean mask for valid propagation steps
       H:   (B, m, n)
       R:   (B, m, m)
       P_start: (B, n, n) -- posterior covariance at interval start
       Inno:(B, m, 1)
       state_pred:(B, n, 1) -- state immediately before the GNSS update
-      q_scale:(B, n) -- positive scales for the diagonal of Q_acc_origin
-      Q_acc_origin:(B, n, n) -- equivalent process noise for the whole interval
+      q_scale:(B, n) -- positive state-wise scales for Qc_origin
+      Qc_origin:(B, n, n) -- continuous-time process-noise intensity
     Returns:
       pos_predict: (B, 3) -- first 3 components of updated state
     This implementation uses torch operations only and adds small jitter to S diagonal
     for numerical stability. Uses torch.linalg.solve when possible.
     """
     eps = 1e-8
-    device = Phi_acc.device
-    dtype = Phi_acc.dtype
+    device = Phi_seq.device
+    dtype = Phi_seq.dtype
     # 强制使用 double 精度进行卡尔曼内部计算，避免 float/double mismatch（保留 autograd）
     try:
         target_dtype = torch.float64
-        Phi_acc = Phi_acc.to(device=device, dtype=target_dtype)
+        Phi_seq = Phi_seq.to(device=device, dtype=target_dtype)
+        Phi_dt = Phi_dt.to(device=device, dtype=target_dtype)
         H = H.to(device=device, dtype=target_dtype)
         R = R.to(device=device, dtype=target_dtype)
         P_start = P_start.to(device=device, dtype=target_dtype)
@@ -406,42 +522,25 @@ def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origi
         if state_pred is not None:
             state_pred = state_pred.to(device=device, dtype=target_dtype)
         q_scale = q_scale.to(device=device, dtype=target_dtype)
-        Q_acc_origin = Q_acc_origin.to(device=device, dtype=target_dtype)
+        Qc_origin = Qc_origin.to(device=device, dtype=target_dtype)
+        if Phi_mask is not None:
+            Phi_mask = Phi_mask.to(device=device, dtype=torch.bool)
         dtype = target_dtype
     except Exception:
         pass
 
-    # Build the predicted equivalent Q for the complete GNSS interval.
+    # Build the predicted continuous-time Qc. D @ Qc @ D preserves symmetry
+    # and positive semidefiniteness while scaling Qc's diagonal by q_scale.
     try:
-            # 支持 Q_diag 为 (B, n)（表示对角缩放因子）或 (B, n, n)（表示与 Q_origin 做按元素缩放）
         if q_scale.dim() == 2:
-            # Q_diag 为 (B, n) 时，视为对 Q_origin 对角线的缩放因子。
-            # 为保留 autograd 路径，避免对张量做 in-place 写操作。
-            # 提取 Q_origin 的对角并按 Q_diag 缩放，然后重建一个对角矩阵并与 Q_origin 的非对角部分合并。
-            # diag_orig: (B, n)
-            try:
-                diag_orig = Q_acc_origin.diagonal(offset=0, dim1=-2, dim2=-1)
-            except Exception:
-                # 兼容较旧 PyTorch 版本的接口
-                diag_orig = torch.stack([torch.diagonal(m) for m in Q_acc_origin], dim=0)
-            # 构造缩放后的对角线（保留 autograd 路径）
-            scaled_diag = diag_orig * q_scale
-            # 构造对角矩阵 (B, n, n) - 现在整个 Q 矩阵都与 Q_diag 相关
-            Q_effective = torch.diag_embed(scaled_diag)
-            # 注意：这里我们不再保留原始的非对角部分，让网络学习完整的 Q 矩阵
-            # --- 调试：检查计算图 ---
-            if torch.is_grad_enabled() and q_scale.requires_grad:
-                # 确保计算图连接
-                pass
-        elif q_scale.dim() == 3 and q_scale.shape == Q_acc_origin.shape:
-            # 如果提供的是与 Q_origin 形状相同的矩阵，则按元素相乘（保留用户意图）
-            Q_effective = Q_acc_origin * q_scale
+            D = torch.diag_embed(torch.sqrt(torch.clamp(q_scale, min=0.0)))
+            Qc_pred = torch.matmul(torch.matmul(D, Qc_origin), D)
+        elif q_scale.dim() == 3 and q_scale.shape == Qc_origin.shape:
+            Qc_pred = Qc_origin * q_scale
         else:
-            # 明确报错，避免静默兼容导致难以发现的问题
-            raise ValueError(f"Unexpected q_scale shape: {tuple(q_scale.shape)}; expected (B,n) or (B,n,n) matching Q_acc_origin {tuple(Q_acc_origin.shape)}")
+            raise ValueError(f"Unexpected q_scale shape: {tuple(q_scale.shape)}; expected (B,n) or (B,n,n) matching Qc_origin {tuple(Qc_origin.shape)}")
     except Exception as e:
-        # 抛出运行时错误以便上层可以捕获并定位问题
-        raise RuntimeError(f"Failed to construct Q_acc_pred from q_scale: {e}")
+        raise RuntimeError(f"Failed to construct predicted Qc from q_scale: {e}")
 
     # 支持 H/R 为非批量（广播）
     if H.dim() == 2:
@@ -449,12 +548,25 @@ def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origi
     if R.dim() == 2:
         R = R.unsqueeze(0).expand(P_start.shape[0], -1, -1)
 
-    # Phi_acc may be unbatched; P_start is propagated exactly once for this interval.
-    if Phi_acc.dim() == 2:
-        Phi_acc = Phi_acc.unsqueeze(0).expand(P_start.shape[0], -1, -1)
-    # Exactly one interval-level prediction. Q_acc_pred must not be recursively added.
-    P_base = torch.matmul(torch.matmul(Phi_acc, P_start), Phi_acc.transpose(-2, -1))
-    P_pred = P_base + Q_effective
+    if Phi_seq.dim() == 3:
+        Phi_seq = Phi_seq.unsqueeze(0)
+    if Phi_dt.dim() == 1:
+        Phi_dt = Phi_dt.unsqueeze(0)
+    if Phi_mask is None:
+        Phi_mask = Phi_dt > 0.0
+    elif Phi_mask.dim() == 1:
+        Phi_mask = Phi_mask.unsqueeze(0)
+    if Phi_seq.shape[:2] != Phi_dt.shape or Phi_dt.shape != Phi_mask.shape:
+        raise ValueError("Phi_seq, Phi_dt and Phi_mask must share batch and step dimensions")
+
+    P_pred = P_start
+    for step in range(Phi_seq.shape[1]):
+        Phi_i = Phi_seq[:, step]
+        dt_i = Phi_dt[:, step].unsqueeze(-1).unsqueeze(-1)
+        Phi_i_t = Phi_i.transpose(-2, -1)
+        Q_i = 0.5 * (torch.matmul(torch.matmul(Phi_i, Qc_pred), Phi_i_t) + Qc_pred) * dt_i
+        P_next = torch.matmul(torch.matmul(Phi_i, P_pred), Phi_i_t) + Q_i
+        P_pred = torch.where(Phi_mask[:, step, None, None], P_next, P_pred)
 
     # 使用先验协方差进行更新
     HP = torch.matmul(H, P_pred)           # (B, m, n)
@@ -470,9 +582,10 @@ def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origi
 
     K = torch.matmul(torch.matmul(P_pred, H.transpose(-2, -1)), S_inv)  # (B, n, m)
 
-    # 更新 state
+    # In the ECEF loose-coupling convention Inno=INS-GNSS and StateX is the
+    # estimated navigation error, so nominal position feedback is subtraction.
     state_update = torch.matmul(K, Inno)  # (B, n, 1)
-    state_post = state_pred + state_update
+    position_post = state_pred[:, 0:3, :] - state_update[:, 0:3, :]
 
     # ====== 合并后的精简 DEBUG 打印 (仅打印第一个样本的前3维) ======
     if state_pred is not None:
@@ -481,13 +594,13 @@ def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origi
                 # 提取数据
                 s_pre = state_pred[0, :3, 0].cpu().numpy()
                 s_upd = state_update[0, :3, 0].cpu().numpy()
-                s_pst = state_post[0, :3, 0].cpu().numpy()
+                s_pst = position_post[0, :3, 0].cpu().numpy()
                 
                 # 格式化函数
                 fmt = lambda x: "[" + ",".join([f"{v:.4f}" for v in x]) + "]"
                 
                 # 单行打印核心链路
-                print(f"DEBUG KF [Pos]: Pre:{fmt(s_pre)} + Upd:{fmt(s_upd)} = Pst:{fmt(s_pst)}")
+                print(f"DEBUG KF [Pos]: Pre:{fmt(s_pre)} - Error:{fmt(s_upd)} = Pst:{fmt(s_pst)}")
         except Exception as e:
             print(f"DEBUG KF: Print failed ({e})")
     # ==========================================================
@@ -498,9 +611,4 @@ def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origi
     temp = I - KH
     P_post = torch.matmul(torch.matmul(temp, P_pred), temp.transpose(-2, -1)) + torch.matmul(torch.matmul(K, R), K.transpose(-2, -1))
 
-    # 若需要将 state_post 变回 (B, n) 形式
-    state_post = state_post.squeeze(-1)
-
-    # 仅返回位置向量的前三个分量作为 pos_predict (B,3)
-    pos_predict = state_post.squeeze(-1)[:, 0:3]
-    return pos_predict
+    return position_post.squeeze(-1)

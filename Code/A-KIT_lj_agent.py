@@ -1,3 +1,14 @@
+"""A-KIT 当前正式训练入口。
+
+职责：读取标准训练配置和数据 catalog，构建轨迹级训练/验证数据集，通过已注册
+模型预测 Qc 缩放，并在可微的逐步 Kalman 传播后计算位置监督损失；同时保存配置、
+环境、指标、归一化参数和 checkpoint。
+
+本文件暂时还包含 Set Transformer 的具体实现和历史诊断代码。新增模型应遵守
+akit_model_api 的 ``forward(imu, p_start) -> raw_qc_scale_logits`` 接口，不应在模型
+内部重复实现 Kalman 或损失。标准入口是本文件，不是 A-KIT_clean.py。
+"""
+
 # 在导入任何可能初始化 OpenMP 的库之前设置环境变量，避免 libiomp5md.dll 重复初始化错误
 import os
 # 不推荐的临时解决方法：允许重复加载 OpenMP 运行时以避免程序中断（可能有风险）
@@ -28,6 +39,7 @@ from akit_runtime import (
     save_json,
     set_reproducible_seed,
 )
+from akit_model_api import build_model, register_model
 
 
 # 控制输出开关（将不需要的输出设为 False）
@@ -123,7 +135,8 @@ def main(config):
     imu_std_tensor = torch.tensor(imu_std, dtype=torch.float64).view(1, -1, 1).to(device)
 
     # 创建 DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    # 每条轨迹内严格按时间顺序读取，不打乱秒级Qc缩放与Phi序列。
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     # ========== 快速自检配置 ==========
@@ -134,24 +147,14 @@ def main(config):
     # ========== 结束配置 ==========
 
     # 3. 构建模型
-    model = Network(
-        patch_size=10,
-        filter_size=10,
-        in_chans=9,
-        embedding_size=64,
-        num_heads=4,
-        feedforward_expansion=128,
-        k=1,
-        blocklayers=2,
-        output_size=15
-    ).to(device).double()
+    model = build_model(config["model"]).to(device).double()
     # 确保所有模型参数为 double
     model = model.double()
 
     # 快速自检：打印第一个训练批次的 Q_origin 对角线统计与 pos_true 量级，并可运行 single-batch overfit
     try:
         sample_batch = next(iter(train_loader))
-        sb_Q_origin = sample_batch["Q_acc"].to(device).float()
+        sb_Q_origin = sample_batch["Qc"].to(device).float()
         try:
             sb_Q_diag = sb_Q_origin.diagonal(offset=0, dim1=1, dim2=2)
         except Exception:
@@ -203,7 +206,11 @@ def main(config):
         print("[QC] Quick-check failed:", e)
 
     # 4. 优化器
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-6)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=config.get("weight_decay", 1e-6),
+    )
 
     # ====== Diagnostic: verify parameters registered in optimizer and require_grad ======
     try:
@@ -308,13 +315,15 @@ def main(config):
                     pass
 
             # 构造 Kalman 需要的矩阵
-            phi = batch["Phi_acc"].to(device).float()
+            phi = batch["Phi_seq"].to(device).float()
+            phi_dt = batch["Phi_dt"].to(device).float()
+            phi_mask = batch["Phi_mask"].to(device)
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
             P = batch["P_start"].to(device).float()
             stateX = batch["state_pred"].to(device).float()
-            Q_origin = batch["Q_acc"].to(device).float()
+            Q_origin = batch["Qc"].to(device).float()
 
 
             # 网络预测 Q 的对角线元素
@@ -356,7 +365,7 @@ def main(config):
                 break
 
             # 直接传入 Q_diag (B,n) 由 kalman_filter 内部处理为对角缩放或按元素矩阵
-            pos_predict = kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
+            pos_predict = kalman_filter(phi, phi_dt, H, R, P, Inno, stateX, Q_diag, Q_origin, phi_mask)
 
             # --- 诊断：检查 pos_predict 是否与 Q_diag 相关 ---
             # 只在第一个batch检查
@@ -468,19 +477,21 @@ def main(config):
                 except Exception:
                     pass
 
-                v_phi = vbatch["Phi_acc"].to(device).float()
+                v_phi = vbatch["Phi_seq"].to(device).float()
+                v_phi_dt = vbatch["Phi_dt"].to(device).float()
+                v_phi_mask = vbatch["Phi_mask"].to(device)
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
                 v_P = vbatch["P_start"].to(device).float()
                 v_stateX = vbatch["state_pred"].to(device).float()
-                v_Q_origin = vbatch["Q_acc"].to(device).float()
+                v_Q_origin = vbatch["Qc"].to(device).float()
 
                 v_Q_diag_float = model(v_imu.to(torch.float32), v_P.unsqueeze(-1).to(torch.float32))
                 v_Q_diag_float = torch.nn.functional.softplus(v_Q_diag_float) + 1.0
                 v_Q_diag = v_Q_diag_float.to(torch.float64) * SCALE_Q
                 # 直接传入 v_Q_diag
-                v_pos_predict = kalman_filter(v_phi, v_H, v_R, v_P, v_Inno, v_stateX, v_Q_diag, v_Q_origin)
+                v_pos_predict = kalman_filter(v_phi, v_phi_dt, v_H, v_R, v_P, v_Inno, v_stateX, v_Q_diag, v_Q_origin, v_phi_mask)
 
                 v_loss = torch.mean((v_pos_predict - v_pos_true) ** 2)
                 total_val_loss += v_loss.item()
@@ -611,7 +622,7 @@ def main(config):
                 t_Q_diag = torch.nn.functional.softplus(t_Q_diag)
                 # 放大用于 TrainOut 的 Q_diag
                 t_Q_diag = t_Q_diag * SCALE_Q
-                t_pos_predict = kalman_filter(tbatch["Phi_acc"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P_start"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["state_pred"].to(device).float(), t_Q_diag, tbatch["Q_acc"].to(device).float())
+                t_pos_predict = kalman_filter(tbatch["Phi_seq"].to(device).float(), tbatch["Phi_dt"].to(device).float(), tbatch["H"].to(device).float(), tbatch["R"].to(device).float(), tbatch["P_start"].to(device).float(), tbatch["Inno"].to(device).float(), tbatch["state_pred"].to(device).float(), t_Q_diag, tbatch["Qc"].to(device).float(), tbatch["Phi_mask"].to(device))
                 all_train_preds.append(t_pos_predict.cpu().numpy())
                 all_train_trues.append(t_pos_true.cpu().numpy())
         if all_train_preds:
@@ -823,6 +834,10 @@ class Network(nn.Module):
         return out
 
 
+# Keep the legacy class importable while exposing it through the common factory.
+register_model("set_transformer", Network)
+
+
 def load_truePos(file_path):
     return utils.load_truePos(file_path)
 
@@ -841,9 +856,9 @@ class IMUDataset(utils.IMUDataset):
     pass
 
 
-def kalman_filter(Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin):
+def kalman_filter(Phi_seq, Phi_dt, H, R, P_start, Inno, state_pred, q_scale, Qc_origin, Phi_mask=None):
     return utils.kalman_filter(
-        Phi_acc, H, R, P_start, Inno, state_pred, q_scale, Q_acc_origin
+        Phi_seq, Phi_dt, H, R, P_start, Inno, state_pred, q_scale, Qc_origin, Phi_mask
     )
 
 
@@ -1094,7 +1109,7 @@ def run_small_scale_experiment(train_dirs,
     train_N = len(train_dataset)
     val_N = len(val_dataset)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     print(f"Small experiment: train={train_N}, val={val_N} (bounded independently)")
@@ -1165,21 +1180,17 @@ def run_small_scale_experiment(train_dirs,
     )
 
     # 构建模型与优化器（与 main 保持一致，使用 float32）
-    model = Network(
-        patch_size=10,
-        filter_size=10,
-        in_chans=9,
-        embedding_size=64,
-        num_heads=4,
-        feedforward_expansion=128,
-        k=1,
-        blocklayers=2,
-        output_size=15
-    ).to(device)
+    if runtime_config is None:
+        raise ValueError("runtime_config is required to build a standardized model")
+    model = build_model(runtime_config["model"]).to(device)
     # 在小实验中也使用 double
     model = model.double()
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-6)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=runtime_config.get("weight_decay", 1e-6),
+    )
 
     # ===== 单批过拟合测试（默认关闭） =====
     if run_overfit:
@@ -1193,7 +1204,7 @@ def run_small_scale_experiment(train_dirs,
         if obatch is not None:
             o_imu = obatch["imu"].to(device).float()
             o_P = obatch["P_start"].to(device).float()
-            o_Q_origin = obatch["Q_acc"].to(device).float()
+            o_Q_origin = obatch["Qc"].to(device).float()
 
             # 目标：使用 Q_origin 的对角线作为网络目标，形状 (B, D)
             try:
@@ -1247,13 +1258,15 @@ def run_small_scale_experiment(train_dirs,
             pos_true = batch["pos_true"].to(device).float()
             imu = (imu - imu_mean_tensor) / imu_std_tensor
 
-            phi = batch["Phi_acc"].to(device).float()
+            phi = batch["Phi_seq"].to(device).float()
+            phi_dt = batch["Phi_dt"].to(device).float()
+            phi_mask = batch["Phi_mask"].to(device)
             H = batch["H"].to(device).float()
             R = batch["R"].to(device).float()
             Inno = batch["Inno"].to(device).float()
             P = batch["P_start"].to(device).float()
             stateX = batch["state_pred"].to(device).float()
-            Q_origin = batch["Q_acc"].to(device).float()
+            Q_origin = batch["Qc"].to(device).float()
 
 
             # 网络预测 Q 的对角线元素
@@ -1272,7 +1285,7 @@ def run_small_scale_experiment(train_dirs,
             except Exception:
                 pass
 
-            pos_predict = kalman_filter(phi, H, R, P, Inno, stateX, Q_diag, Q_origin)
+            pos_predict = kalman_filter(phi, phi_dt, H, R, P, Inno, stateX, Q_diag, Q_origin, phi_mask)
 
             loss = torch.mean((pos_predict - pos_true) ** 2)
 
@@ -1339,19 +1352,21 @@ def run_small_scale_experiment(train_dirs,
                 v_pos_true = vbatch["pos_true"].to(device).float()
                 v_imu = (v_imu - imu_mean_tensor) / imu_std_tensor
 
-                v_phi = vbatch["Phi_acc"].to(device).float()
+                v_phi = vbatch["Phi_seq"].to(device).float()
+                v_phi_dt = vbatch["Phi_dt"].to(device).float()
+                v_phi_mask = vbatch["Phi_mask"].to(device)
                 v_H = vbatch["H"].to(device).float()
                 v_R = vbatch["R"].to(device).float()
                 v_Inno = vbatch["Inno"].to(device).float()
                 v_P = vbatch["P_start"].to(device).float()
                 v_stateX = vbatch["state_pred"].to(device).float()
-                v_Q_origin = vbatch["Q_acc"].to(device).float()
+                v_Q_origin = vbatch["Qc"].to(device).float()
 
                 v_Q_diag = model(v_imu, v_P.unsqueeze(-1))
                 v_Q_diag = torch.nn.functional.softplus(v_Q_diag)
                 # 小实验验证阶段放大
                 v_Q_diag = v_Q_diag * SCALE_Q
-                v_pos_predict = kalman_filter(v_phi, v_H, v_R, v_P, v_Inno, v_stateX, v_Q_diag, v_Q_origin)
+                v_pos_predict = kalman_filter(v_phi, v_phi_dt, v_H, v_R, v_P, v_Inno, v_stateX, v_Q_diag, v_Q_origin, v_phi_mask)
 
                 v_loss = torch.mean((v_pos_predict - v_pos_true) ** 2)
                 total_val_loss += v_loss.item()
@@ -1388,8 +1403,9 @@ def parse_args():
         description="A-KIT GNSS-interval equivalent-Q training entry point",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--config", help="standardized JSON training config; explicit CLI values override it")
     parser.add_argument("--small", action="store_true", help="run a bounded diagnostic experiment")
-    parser.add_argument("--data-root", default=os.path.join(repo_root, "data_lj"))
+    parser.add_argument("--data-root", default=os.path.join(repo_root, "data"))
     parser.add_argument(
         "--train-dirs",
         nargs="+",
@@ -1421,7 +1437,65 @@ def parse_args():
 
 
 def build_runtime_config(args):
+    import json
+
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if args.config:
+        config_path = os.path.abspath(os.path.expanduser(args.config))
+        with open(config_path, "r", encoding="utf-8") as handle:
+            standard = json.load(handle)
+        if standard.get("schema_version") != "akit-training-config-1":
+            raise ValueError("Unsupported training config schema_version")
+        data_config = standard["data"]
+        catalog_path = data_config["catalog"]
+        if not os.path.isabs(catalog_path):
+            catalog_path = os.path.join(repo_root, catalog_path)
+        with open(catalog_path, "r", encoding="utf-8") as handle:
+            catalog = json.load(handle)
+        data_root = os.path.dirname(os.path.abspath(catalog_path))
+        train_splits = set(data_config["train_splits"])
+        val_splits = set(data_config["validation_splits"])
+        if train_splits & val_splits:
+            raise ValueError("Training and validation splits must be disjoint")
+        train_names = [item["path"] for item in catalog["datasets"] if item["split"] in train_splits]
+        val_names = [item["path"] for item in catalog["datasets"] if item["split"] in val_splits]
+        if not train_names or not val_names:
+            raise ValueError("Configured train/validation splits resolved to no trajectories")
+        experiment = standard["experiment"]
+        training = standard["training"]
+        optimizer = training["optimizer"]
+        output_root = experiment["output_root"]
+        if not os.path.isabs(output_root):
+            output_root = os.path.join(repo_root, output_root)
+        return {
+            "schema_version": standard["schema_version"],
+            "config_path": config_path,
+            "mode": "small" if args.small else "gnss_interval_equivalent_q",
+            "scientific_status": "gnss_interval_equivalent_q",
+            "repo_root": repo_root,
+            "data_root": data_root,
+            "data_catalog": os.path.abspath(catalog_path),
+            "train_dir_names": train_names,
+            "val_dir_names": val_names,
+            "train_dirs": resolve_data_dirs(data_root, train_names),
+            "val_dirs": resolve_data_dirs(data_root, val_names),
+            "epochs": args.epochs if args.epochs is not None else training["epochs"],
+            "batch_size": args.batch_size if args.batch_size is not None else training["batch_size"],
+            "learning_rate": args.learning_rate if args.learning_rate is not None else optimizer["learning_rate"],
+            "weight_decay": optimizer["weight_decay"],
+            "seq_len": data_config["sequence_length"],
+            "max_samples": args.max_samples,
+            "seed": experiment["seed"],
+            "device": experiment["device"],
+            "output_root": os.path.abspath(output_root),
+            "experiment_name": experiment["name"] + ("_small" if args.small else ""),
+            "run_overfit": bool(args.run_overfit),
+            "overfit_steps": args.overfit_steps,
+            "overfit_lr": args.overfit_lr,
+            "model": standard["model"],
+            "training": training,
+            "checkpoint": standard["checkpoint"],
+        }
     small = bool(args.small)
     epochs = args.epochs if args.epochs is not None else (5 if small else 50)
     batch_size = args.batch_size if args.batch_size is not None else (8 if small else 32)
@@ -1460,15 +1534,21 @@ def build_runtime_config(args):
         "overfit_lr": args.overfit_lr,
         "model": {
             "name": "set_transformer",
-            "patch_size": 10,
-            "filter_size": 10,
-            "in_chans": 9,
-            "embedding_size": 64,
-            "num_heads": 4,
-            "feedforward_expansion": 128,
-            "k": 1,
-            "blocklayers": 2,
-            "output_size": 15,
+            "interface_version": "akit-model-1",
+            "input_channels": 9,
+            "state_dim": 15,
+            "output_semantics": "raw_qc_scale_logits",
+            "parameters": {
+                "patch_size": 10,
+                "filter_size": 10,
+                "in_chans": 9,
+                "embedding_size": 64,
+                "num_heads": 4,
+                "feedforward_expansion": 128,
+                "k": 1,
+                "blocklayers": 2,
+                "output_size": 15,
+            },
         },
     }
 
@@ -1477,7 +1557,7 @@ if __name__ == "__main__":
     cli_args = parse_args()
     runtime_config = build_runtime_config(cli_args)
     print(
-        "A-KIT: using one GNSS-interval Phi_acc/P_start/Q_acc covariance prediction per sample."
+        "A-KIT: scaling Qc once per second and replaying every saved Phi in time order."
     )
     if cli_args.small:
         run_small_scale_experiment(

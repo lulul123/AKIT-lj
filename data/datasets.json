@@ -1,0 +1,146 @@
+{
+  "schema_version": "akit-dataset-catalog-0.1-draft",
+  "status": "draft_with_unverified_semantics",
+  "project": {
+    "name": "A-KIT-lj",
+    "task_type": "indirect_supervised",
+    "pipeline": "qc_scaling_with_stepwise_phi_replay",
+    "metadata_updated_at": "2026-10-23",
+    "data_contract": "../docs/数据总说明.md"
+  },
+  "metadata_resolution": {
+    "rule": "Merge defaults with the matching entry in datasets. Dataset-specific exceptions belong in that entry's overrides object.",
+    "path_base": "Each file path is relative to the trajectory directory declared by the entry's path field.",
+    "single_source_of_truth": true
+  },
+  "defaults": {
+    "source": {
+      "ips_application": "IPS",
+      "ips_code_version": null,
+      "ips_code_version_status": "unverified",
+      "reference_solution_producer": "Inertial Explorer",
+      "reference_solution_type": "GNSS/INS Epochs (Smoothed TC Combined)",
+      "datum": "WGS84"
+    },
+    "time": {
+      "system": "GPS week seconds",
+      "timestamp_unit": "s",
+      "expected_imu_rate_hz": 100,
+      "sample_window_duration_s": 1.0,
+      "imu_velocity_grouping_rule": "sample key k represents [k-1, k)",
+      "phi_grouping_rule": "sample key k uses propagation endpoints k-1 < t_phi <= k",
+      "grouping_rule_status": "confirmed"
+    },
+    "files": {
+      "imu": "imu.txt",
+      "velocity": "Vel.txt",
+      "phi": "Phi.txt",
+      "qc": "Qc.txt",
+      "p_start": "PStart.txt",
+      "p_pred_cpp": "PPredCpp.txt",
+      "measurement_matrix": "H.txt",
+      "measurement_covariance": "R.txt",
+      "innovation": "Inno.txt",
+      "nominal_state_prior": "GNSSMech.txt",
+      "discrete_q_debug": "Q.txt",
+      "legacy_state": "stateX.txt",
+      "legacy_state_new": "StateX_new.txt"
+    },
+    "required_file_keys": [
+      "imu", "velocity", "phi", "qc", "p_start",
+      "measurement_matrix", "measurement_covariance", "innovation",
+      "nominal_state_prior", "position_reference"
+    ],
+    "optional_file_keys": ["p_pred_cpp", "discrete_q_debug", "legacy_state", "legacy_state_new"],
+    "reference_label": {
+      "selected_columns_one_based": [10, 11, 12],
+      "selected_column_names": ["X-ECEF", "Y-ECEF", "Z-ECEF"],
+      "coordinate_frame": "ECEF",
+      "units": "m"
+    },
+    "sample_contract": {
+      "imu_window": [100, 6],
+      "velocity_window": [100, 3],
+      "phi_sequence": [null, 15, 15],
+      "phi_dt": [null],
+      "qc": [15, 15],
+      "p_start": [15, 15],
+      "h": [3, 15],
+      "r": [3, 3],
+      "innovation": [3, 1],
+      "nominal_state_prior": [15, 1],
+      "reference_position": [3],
+      "model_output_qc_scale": [15]
+    },
+    "confirmed_semantics": [
+      "Phi timestamp is the propagation endpoint",
+      "PStart(k) is the posterior covariance at the previous successful GNSS boundary",
+      "GNSSMech(k) is the pre-update nominal state at k",
+      "ECEF position innovation is INS prediction minus GNSS position",
+      "nominal ECEF position feedback subtracts the estimated position error"
+    ],
+    "implemented_pipeline_semantics": [
+      "right-closed Phi grouping",
+      "variable-length Phi batching with mask",
+      "stepwise Phi/dt covariance replay",
+      "Python nominal-position subtraction feedback"
+    ],
+    "implementation_pending": [
+      "full-dataset numerical replay comparison against C++ prior covariance"
+    ]
+  },
+  "split_policy": {
+    "unit": "whole_trajectory",
+    "random_adjacent_sample_split_allowed": false,
+    "normalization_statistics_source": "train_only",
+    "assignment_status": "provisional"
+  },
+  "datasets": [
+    {
+      "dataset_id": "data065517",
+      "trajectory_id": "065517",
+      "path": "data065517",
+      "gps_week": 2077,
+      "position_reference": "065503_I.IMR.ref",
+      "split": "train",
+      "validation_status": "not_run"
+    },
+    {
+      "dataset_id": "data090854",
+      "trajectory_id": "090854",
+      "path": "data090854",
+      "gps_week": 2128,
+      "position_reference": "090839_I.IMR.ref",
+      "split": "train",
+      "validation_status": "not_run"
+    },
+    {
+      "dataset_id": "data122041",
+      "trajectory_id": "122041",
+      "path": "data122041",
+      "gps_week": 2226,
+      "position_reference": "122043_I.IMR.ref",
+      "split": "train",
+      "validation_status": "not_run"
+    },
+    {
+      "dataset_id": "data212832",
+      "trajectory_id": "212832",
+      "path": "data212832",
+      "gps_week": 2105,
+      "position_reference": "212817_I.IMR.ref",
+      "split": "validation",
+      "validation_status": "not_run",
+      "data_refresh_note": "Qc.txt and GNSSMech.txt regenerated on 2026-10-23; full validation pending."
+    },
+    {
+      "dataset_id": "data013325",
+      "trajectory_id": "013325",
+      "path": "data013325",
+      "gps_week": 2106,
+      "position_reference": "013311_I.IMR.ref",
+      "split": "test",
+      "validation_status": "not_run"
+    }
+  ]
+}

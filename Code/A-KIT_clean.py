@@ -1,9 +1,22 @@
+"""A-KIT 早期独立训练实现，仅保留用于历史对照。
+
+该文件把数据读取、模型和训练逻辑放在一个脚本中，路径与参数也较多为硬编码，不属于
+当前标准化训练入口。新实验应使用 A-KIT_lj_agent.py 和 configs 下的 JSON；除非进行
+历史结果复现，不建议继续在本文件上扩展功能。
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 import os
+import math
+
+
+def sample_window_key(timestamp):
+    """Return k for the left-closed, right-open sample window [k-1, k)."""
+    return math.floor(timestamp) + 1
 
 
 def main():
@@ -396,7 +409,7 @@ class MultiDatasetIMU(Dataset):
                 
                 # 提取整数秒部分
                 full_time = float(values[0])
-                second = int(full_time)
+                second = sample_window_key(full_time)
                 data_values = [float(v) for v in values[1:data_dim+1]]
                 
                 # 按整数秒分组

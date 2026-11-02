@@ -1,0 +1,53 @@
+{
+  "schema_version": "akit-training-config-1",
+  "experiment": {
+    "name": "akit_set_transformer",
+    "seed": 42,
+    "device": "auto",
+    "output_root": "runs"
+  },
+  "data": {
+    "catalog": "data/datasets.json",
+    "train_splits": ["train"],
+    "validation_splits": ["validation"],
+    "sequence_length": 100,
+    "normalization": "train_global_per_channel"
+  },
+  "model": {
+    "name": "set_transformer",
+    "interface_version": "akit-model-1",
+    "input_channels": 9,
+    "state_dim": 15,
+    "output_semantics": "raw_qc_scale_logits",
+    "parameters": {
+      "patch_size": 10,
+      "filter_size": 10,
+      "in_chans": 9,
+      "embedding_size": 64,
+      "num_heads": 4,
+      "feedforward_expansion": 128,
+      "k": 1,
+      "blocklayers": 2,
+      "output_size": 15
+    }
+  },
+  "training": {
+    "epochs": 50,
+    "batch_size": 32,
+    "optimizer": {
+      "name": "adam",
+      "learning_rate": 0.005,
+      "weight_decay": 0.000001
+    },
+    "loss": "position_mse_through_kalman",
+    "gradient_clip_norm": 1.0,
+    "shuffle": false,
+    "drop_last": true
+  },
+  "checkpoint": {
+    "monitor": "validation_loss",
+    "mode": "min",
+    "save_best": true,
+    "save_final": true
+  }
+}

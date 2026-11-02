@@ -11,13 +11,20 @@ resample_500_to_100.py
  - pick: 每隔 factor=5 选择一个样本（速度快，保留原始时间戳）
  - avg: 每 5 个样本做平均（平滑时间戳和数值）
 
-注意：脚本只保留那些在某一整数秒内恰好有 500 个样本的秒，其他秒会被跳过并打印提示。
+注意：脚本按结束时间键 k 分组，只保留 `[k-1, k)` 内恰好有 500
+个样本的窗口，其他窗口会被跳过并打印提示。
 """
 
 import os
+import math
 import argparse
 from collections import defaultdict
 import numpy as np
+
+
+def sample_window_key(timestamp):
+    """Return k for the left-closed, right-open sample window [k-1, k)."""
+    return math.floor(timestamp) + 1
 
 
 def resample_file(input_path, output_path, source_rate=500, target_rate=100, method='pick', float_fmt='%.6f'):
@@ -49,7 +56,7 @@ def resample_file(input_path, output_path, source_rate=500, target_rate=100, met
             # 无效行跳过
             continue
         values = [float(x) for x in parts[1:]] if len(parts) > 1 else []
-        sec = int(ts)
+        sec = sample_window_key(ts)
         groups[sec].append((ts, values))
 
     kept_seconds = []
@@ -226,7 +233,7 @@ def resample_pair_imu_vel(imu_path, vel_path, out_imu_path, out_vel_path,
     from collections import defaultdict
     sec_groups = defaultdict(list)  # sec -> list of (ts, imu_vals, vel_vals)
     for ts in paired_ts:
-        sec = int(ts)
+        sec = sample_window_key(ts)
         sec_groups[sec].append((ts, imu_map[ts], vel_map[ts]))
 
     # 下采样/对每秒做 pick 或 avg，确保每秒输出 target_rate

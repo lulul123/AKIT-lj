@@ -1,8 +1,15 @@
 # 本地数据，不上传
 data_lj/
+data/data*/
+
+# 数据目录中只提交 catalog、说明和小型统计，不提交原始轨迹
+data/**/__pycache__/
 
 # 本地参考源码，不上传
 referance/
+copy/
+refcode1/
+refcode1029/
 
 # Python 缓存
 __pycache__/
@@ -16,10 +23,20 @@ venv/
 # 编辑器
 .vscode/
 .idea/
+.agents/
+.codex/
 
 # 输出和日志
 outputs/
 results/
 logs/
+runs/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
 *.log
 *.tmp
+
+# 大型本地参考资料不影响服务器训练
+docs/*.pdf
